@@ -75,6 +75,8 @@ class SustainDCMetricsCallback(BaseCallback):
                     self.logger.record_mean(f'sustaindc/{name}_mean', v / max(self._steps[i], 1))
                 self.logger.record_mean('sustaindc/ls_tasks_queued_end', float(info.get('ls_tasks_in_queue', 0.0)))
                 self.logger.record_mean('sustaindc/end_queue_penalty', float(info.get('end_queue_penalty', 0.0)))
+                self.logger.record_mean('sustaindc/co2_work_adjusted_kg',
+                                        self._sums[i]['CO2_footprint_sum'] / 1e3 + float(info.get('unexecuted_work_co2_kg', 0.0)))
                 self._sums[i] = dict.fromkeys(EPISODE_SUM_METRICS, 0.0)
                 self._means[i] = dict.fromkeys(EPISODE_MEAN_METRICS, 0.0)
                 self._steps[i] = 0
@@ -134,6 +136,8 @@ class FixedSeedEvalCallback(EvalCallback):
             return
         ep = {k: v for k, v in acc.items() if k not in ('setpoint_sum', 'steps')}
         ep['tasks_queued_end'] = float(info.get('ls_tasks_in_queue', 0.0))
+        # Unexecuted work (dropped or still queued) charged at its marginal energy x mean CI, as in eval_compare.
+        ep['co2_work_adjusted_kg'] = acc['co2_kg'] + float(info.get('unexecuted_work_co2_kg', 0.0))
         ep['avg_setpoint'] = acc['setpoint_sum'] / max(acc['steps'], 1)
         ep['reward'] = float(locals_['current_rewards'][i])  # eval rewards are not normalized
         self._episodes.append(ep)
@@ -144,11 +148,29 @@ class FixedSeedEvalCallback(EvalCallback):
             for k, v in means.items():
                 if k != 'reward':
                     self.logger.record(f'eval/{k}', v)
+            header = ['timesteps'] + list(means)
+            _align_metrics_csv(self.metrics_csv, header)
             write_header = not os.path.exists(self.metrics_csv)
             with open(self.metrics_csv, 'a') as f:
                 if write_header:
-                    f.write(','.join(['timesteps'] + list(means)) + '\n')
+                    f.write(','.join(header) + '\n')
                 f.write(','.join(f'{x:.6g}' for x in [self.num_timesteps] + list(means.values())) + '\n')
+
+
+def _align_metrics_csv(path, header):
+    """Make an existing metrics.csv (e.g. of a run resumed with newer code) use `header`, blank for missing columns."""
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        lines = f.read().splitlines()
+    old = lines[0].split(',') if lines else []
+    if old == header:
+        return
+    rows = [dict(zip(old, l.split(','))) for l in lines[1:]]
+    with open(path, 'w') as f:
+        f.write(','.join(header) + '\n')
+        for r in rows:
+            f.write(','.join(r.get(k, '') for k in header) + '\n')
 
 
 def vecnormalize_path(model_path):

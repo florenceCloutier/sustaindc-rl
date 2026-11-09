@@ -83,6 +83,7 @@ class SustainDCSingleAgentEnv(gym.Env):
             random.seed(seed)
             np.random.seed(seed)
         self.env.reset()
+        self._work = dict(submitted=0.0, executed=0.0, ci_sum=0.0, amb_sum=0.0, steps=0)
         return self._obs(), {}
 
     def step(self, action):
@@ -91,11 +92,34 @@ class SustainDCSingleAgentEnv(gym.Env):
         truncated = bool(truncs.get('__all__', False) or truncs['agent_ls'])
         # info['agent_ls'] already merges ls/dc/bat infos and the reward params.
         info = info['agent_ls']
-        if truncated and self.end_queue_penalty:
-            penalty = self.end_queue_penalty * float(info.get('ls_tasks_in_queue', 0))
-            reward -= penalty
-            info = {**info, 'end_queue_penalty': penalty}
+        w = self._work
+        w['submitted'] += float(info['ls_original_workload'])
+        w['executed'] += float(info['ls_shifted_workload'])
+        w['ci_sum'] += float(info['bat_avg_CI'])
+        w['amb_sum'] += float(info['outside_temp'])
+        w['steps'] += 1
+        if truncated:
+            info = {**info, 'unexecuted_work_co2_kg': self.unexecuted_work_co2_kg()}
+            if self.end_queue_penalty:
+                penalty = self.end_queue_penalty * float(info.get('ls_tasks_in_queue', 0))
+                reward -= penalty
+                info['end_queue_penalty'] = penalty
         return self._obs(), reward, False, truncated, info
+
+    def unexecuted_work_co2_kg(self):
+        """CO2 (kg) of the work submitted so far this episode but never run (dropped or still queued).
+
+        Charged like eval_compare's work-adjusted CO2: the unexecuted utilization-steps x the marginal energy of
+        running them (IT + HVAC at the mean utilization, 18 C, mean outdoor temperature) x the mean carbon intensity.
+        Episode CO2 + this = work-adjusted CO2, so a policy can't look greener by not doing the work.
+        """
+        from eval_compare import marginal_kwh_per_util_step  # lazy: eval_compare imports this module
+        w = self._work
+        unexecuted = max(w['submitted'] - w['executed'], 0.0)
+        if unexecuted == 0.0 or w['steps'] == 0:
+            return 0.0
+        n = w['steps']
+        return unexecuted * marginal_kwh_per_util_step(self.env, w['submitted'] / n, w['amb_sum'] / n) * (w['ci_sum'] / n) / 1e3
 
     def reset_reward_history(self):
         """Clear this process's energy history used by the reward normalization.

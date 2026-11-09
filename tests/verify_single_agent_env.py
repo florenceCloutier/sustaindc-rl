@@ -126,5 +126,29 @@ check("last step loses penalty x leftover tasks", np.isclose(r0[-1] - r2[-1], 2.
       f"{r0[-1] - r2[-1]:.1f} vs {2.0 * i2['ls_tasks_in_queue']:.1f}")
 check("info reports the penalty", np.isclose(i2['end_queue_penalty'], 2.0 * i2['ls_tasks_in_queue']) and 'end_queue_penalty' not in i0)
 
+print("6. Work-adjusted CO2 matches eval_compare")
+from eval_compare import run_episode
+
+
+class Scripted:
+    def __init__(self, action):
+        self.action = action
+    def reset(self, seed):
+        pass
+    def act(self, sdc):
+        return {'agent_ls': self.action[0], 'agent_dc': self.action[1], 'agent_bat': self.action[2]}
+
+
+for name, action in [("always defer", (0, 1, 2)), ("do nothing", (1, 1, 2))]:
+    e = SustainDCSingleAgentEnv(dict(BASE)); e.reset(seed=7); co2 = 0.0
+    while True:
+        _, _, _, trunc, info = e.step(np.array(action)); co2 += info['bat_CO2_footprint'] / 1e3
+        if trunc:
+            break
+    m, _ = run_episode(e.env, Scripted(action), 7)
+    adj = co2 + info['unexecuted_work_co2_kg']
+    check(f"{name}: env CO2 + unexecuted work == eval_compare co2_work_adjusted", np.isclose(adj, m['co2_work_adjusted'], rtol=1e-6),
+          f"{adj:.2f} vs {m['co2_work_adjusted']:.2f} kg, unexecuted {info['unexecuted_work_co2_kg']:.2f} kg")
+
 print(f"\n{sum(results)}/{len(results)} checks passed")
 sys.exit(0 if all(results) else 1)
