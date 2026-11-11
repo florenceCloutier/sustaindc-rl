@@ -111,7 +111,7 @@ def simulate_queue(q0, actions, workload, ns_frac, sh_frac, qmax):
         proc = np.where((a == 2) & (cap2 >= 1), np.minimum(np.minimum(sh, cap2), total), 0.0)
         if proc.any():
             pop_oldest(q, proc)
-        util[:, k] = (ns + sh - add + proc + odp) / 100
+        util[:, k] = (ns + sh - add - dropped[:, k] + proc + odp) / 100  # dropped tasks are not run
         q[:, 0] += add
         # one step older
         q[:, OVERDUE] += q[:, OVERDUE - 1]
@@ -164,7 +164,7 @@ def forecasts(sdc, horizon, mode):
         wl = np.clip(blend_forecast(wl_all, t_wl, horizon, min(horizon, 2)), 0.0, 1.0)
     else:
         raise ValueError(f'Unknown forecast mode {mode!r}; use realistic or perfect')
-    wl[0] = float(sdc.ls_env.workload)
+    wl[0] = float(sdc.ls_env.planned_workload())  # includes work a geo dispatcher routed here this step
     return ci, wl, np.asarray(ci_all[t_ci - DAY:t_ci], float), np.asarray(wl_all[t_wl - DAY:t_wl], float)
 
 

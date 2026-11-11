@@ -68,6 +68,14 @@ def setpoint_action(current, target):
 def expected_utilization(sdc, ls_action):
     """Approximate CPU utilization this step after the load-shifting action (used by the cooling controller)."""
     ls = sdc.ls_env
+    if ls.shiftable_override is not None:  # geo-distributed: the shiftable tasks were routed here by a dispatcher
+        non_shiftable, shiftable = ls.planned_tasks()
+        w = min((non_shiftable + shiftable) / 100, 1.0)
+        if ls_action == 0:
+            return non_shiftable / 100
+        if ls_action == 2:
+            return max(w, min(0.9, w + min(len(ls.tasks_queue), shiftable) / 100))
+        return w
     w = float(ls.workload)
     if ls_action == 0:
         return w * (1 - ls.flexible_workload_ratio)
@@ -82,7 +90,7 @@ def expected_utilization(sdc, ls_action):
 def queue_can_take(sdc):
     """True if deferring this step's flexible tasks fits in the queue (otherwise the env drops the excess)."""
     ls = sdc.ls_env
-    shiftable = int(np.floor(float(ls.workload) * ls.flexible_workload_ratio * 100))
+    shiftable = ls.planned_tasks()[1]  # the local share, or the tasks a geo dispatcher routed here
     return len(ls.tasks_queue) + shiftable <= ls.queue_max_len
 
 

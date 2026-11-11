@@ -19,6 +19,7 @@ from utils.managers import (CI_Manager, PV_Manager, Time_Manager, Weather_Manage
                             Workload_Manager, epw_utc_offset)
 from utils.utils_cf import get_energy_variables, get_init_day, obtain_paths
 from utils.joint_obs import PV_OBS_DIM as N_PV_OBS
+from utils.joint_obs import BAT_WORKLOAD_IDX, DC_NEXT_WORKLOAD_IDX, DC_WORKLOAD_IDX, LS_WORKLOAD_IDX
 
 import matplotlib
 matplotlib.use('Agg')  # Use a non-interactive backend suitable for servers without display
@@ -501,17 +502,39 @@ class SustainDC(gym.Env):
         return bat_state
 
 
-    def reset(self):
+    def draw_start(self):
+        """Random episode start (day of year, hour), drawn with the `random` module."""
+        day = random.randint(max(0, self.ranges_day[0]), min(364, self.ranges_day[1]))
+        return day, random.randint(0, 23)
+
+    def set_routed_shiftable_tasks(self, n_tasks):
+        """Geo-distributed mode: the shiftable tasks of the next step() are `n_tasks` (set by GeoSustainDC's
+        dispatcher) instead of the local flexible share of the workload. Consumed by the next step().
+
+        The agents' observations are updated in place so that they see the work they will actually be asked to run:
+        their current-workload entries become the planned workload (local + net routed-in tasks), and the cooling
+        agent's next-workload entry is shifted by the same amount (the next routing is not known yet). When the
+        routed tasks equal the local share, the observations are unchanged."""
+        ls = self.ls_env
+        own = float(ls.workload)
+        ls.shiftable_override = int(n_tasks)
+        planned = ls.planned_workload()
+        delta = planned - own
+        self.ls_state[LS_WORKLOAD_IDX] = planned
+        self.dc_state[DC_WORKLOAD_IDX] = planned
+        self.dc_state[DC_NEXT_WORKLOAD_IDX] = min(max(float(self.workload_m.get_next_workload()) + delta, 0.0), 1.5)
+        self.bat_state[BAT_WORKLOAD_IDX] = planned
+
+    def reset(self, init_day=None, init_hour=None):
         """
         Reset the environment.
 
         Args:
-            seed (int, optional): Random seed.
-            options (dict, optional): Environment options.
+            init_day, init_hour (int, optional): episode start (local standard time of the site). Drawn at random
+                (draw_start) when not given; GeoSustainDC passes them to keep its sites on the same clock.
 
         Returns:
             states (dict): Dictionary of states.
-            infos (dict): Dictionary of infos.
         """
         # Reset termination and reward flags for all agents
         self.ls_terminated = self.dc_terminated = self.bat_terminated = False
@@ -519,8 +542,10 @@ class SustainDC(gym.Env):
         self.ls_reward = self.dc_reward = self.bat_reward = 0
 
         # Reset the managers
-        random_init_day =  random.randint(max(0, self.ranges_day[0]), min(364, self.ranges_day[1])) # self.init_day 
-        random_init_hour = random.randint(0, 23)
+        if init_day is None or init_hour is None:
+            random_init_day, random_init_hour = self.draw_start()
+        else:
+            random_init_day, random_init_hour = int(init_day), int(init_hour)
         self.current_hour = random_init_hour
         
         t_i = self.t_m.reset(init_day=random_init_day, init_hour=random_init_hour)
