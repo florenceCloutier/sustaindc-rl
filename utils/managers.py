@@ -525,8 +525,13 @@ class Weather_Manager():
         pres_column (int, optional): Column that contains the pressure data. Defaults to 9.
         timezone_shift (int, optional): Shift for the timezone. Defaults to 0.
     """
-    def __init__(self, filename='', location='NY', init_day=0, weight=0.02, desired_std_dev=0.75, temp_column=6, rh_column=8, pres_column=9, timezone_shift=0, debug=False):
+    def __init__(self, filename='', location='NY', init_day=0, weight=0.02, desired_std_dev=0.75, temp_column=6, rh_column=8, pres_column=9, timezone_shift=0, debug=False,
+                 day_roll=True):
         """Initialize the Weather_Manager class.
+
+        day_roll: on each reset, roll the weather by a random 0-13 days (data augmentation for typical-year EPW files).
+            Set False for real, dated weather (e.g. DCcluster-Opt regions) so it stays aligned with the CI of the
+            same dates.
 
         Args:
             filename (str, optional): Filename of the weather data. Defaults to ''.
@@ -591,6 +596,7 @@ class Weather_Manager():
         self.time_steps_day = self.timestep_per_hour*24
         
         self.debug = debug
+        self.day_roll = bool(day_roll)
         self.last_roll_days = 0
 
     # Function to return all weather data
@@ -623,7 +629,7 @@ class Weather_Manager():
             self.temperature_data = self.original_temp_data + coh_noise
             self.wet_bulb_data = self.original_wb_data + coh_noise
             
-            num_roll_days = np.random.randint(0, 14) # Random roll the temperature some days.
+            num_roll_days = np.random.randint(0, 14) if self.day_roll else 0  # Random roll the temperature some days.
             self.last_roll_days = num_roll_days  # PV_Manager applies the same roll so PV stays in sync with the weather
             self.temperature_data =  np.roll(self.temperature_data, num_roll_days*self.timestep_per_hour*24)
             self.wet_bulb_data =  np.roll(self.wet_bulb_data, num_roll_days*self.timestep_per_hour*24)
