@@ -587,6 +587,25 @@ Runs go to `$SDC_RUNS/<exp>` (default `results/marl_runs/<exp>`): job scripts, S
 `git worktree add ../code-$(git rev-parse --short HEAD) HEAD` and launch with `CODE=../code-<sha>`. Other options
 (`SBATCH_ARGS`, `EXTRA`, `DRY_RUN=1`) are described at the top of the script.
 
+### All methods on Slurm (single-agent PPO and learned MPC next to MARL)
+
+`scripts/single/launch.sh` (single-agent PPO) and `scripts/mpc/launch.sh` (learned-value MPC) work like
+`scripts/marl/launch.sh` (same environment variables), and write to the same `$SDC_RUNS/<exp>` folder, so one
+experiment holds every method. Each has an `eval.sh` that scores its runs on the shared protocol. Example: every
+method, 3 seeds, az, no PV:
+
+```bash
+export SDC_RUNS=$SCRATCH/sustaindc-rl_results CODE=../code-<sha> PYTHON=$(command -v python) SBATCH_ARGS="-p main-cpu,long-cpu"
+REWARD=co2 WANDB=0 scripts/marl/launch.sh grid_v1 20000000 08:00:00 "happo mappo" az "1 2 3"
+scripts/single/launch.sh grid_v1 20000000 08:00:00 az "1 2 3"
+scripts/mpc/launch.sh grid_v1 04:00:00 az "1 2 3"
+# once training is done: one evaluation job per method, then one table
+for a in happo mappo; do sbatch -c 8 --mem 16G -t 04:00:00 scripts/marl/eval.sh grid_v1 az $a; done
+sbatch -c 8 --mem 16G -t 04:00:00 scripts/single/eval.sh grid_v1 az
+sbatch -c 8 --mem 16G -t 04:00:00 scripts/mpc/eval.sh grid_v1 az
+python eval_compare.py --combine $SDC_RUNS/grid_v1/eval/az/{happo,mappo,single_ppo,mpc} --out_dir $SDC_RUNS/grid_v1/eval/az/all
+```
+
 ## Evaluation Metrics
 - Carbon Footprint (CFP): Cumulative carbon emissions over the evaluation period.
 - HVAC Energy: Energy consumed by the DC cooling system.
