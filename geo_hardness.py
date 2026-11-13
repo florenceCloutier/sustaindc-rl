@@ -82,7 +82,7 @@ def run_case(regions_name, month, util, seed, args):
         r.pop('util', None)
         case['lp'][v] = r
         print(f"  [{regions_name} m{month} u{util} s{seed}] LP {v:>9}: {r['co2_kg']:10.1f} kg "
-              f"(exact at LP schedule {r.get('exact_model_at_lp_kg', float('nan')):.1f}), late {r.get('late_job_mwh', 0):.2f} MWh, "
+              f"(exact at LP schedule {r.get('exact_model_at_lp_kg', float('nan')):.1f}), late {r.get('late_job_mwh', 0):.2f} MWh, overflow {r.get('overflow_job_mwh', 0):.2f} MWh, "
               f"{r['n_vars']} vars, {r['solve_s']:.0f}s", flush=True)
     return case
 

@@ -84,9 +84,14 @@ class JobDispatcher:
         self.A_cum = np.concatenate([np.zeros((geo.n_sites, 1)), np.cumsum(self.A, axis=1)], axis=1)
         if self.kind == 'merit_defer':
             past = []
-            for s in geo.sites:
+            for i, s in enumerate(geo.sites):
                 t0 = s.ci_m.time_step
-                past.append(np.asarray(s.ci_m.carbon_smooth[max(0, t0 - 96):t0], dtype=float))
+                p = np.asarray(s.ci_m.carbon_smooth[max(0, t0 - 96):t0], dtype=float)
+                # Episodes starting less than a day into the data year (and sites in other time zones start at other
+                # local steps) have a shorter past: pad on the left with the earliest known value, so every site
+                # has the same 96-step window.
+                fill = p[0] if len(p) else self.ci[i, 0]
+                past.append(np.concatenate([np.full(96 - len(p), fill), p]))
             self.ci_hist = np.concatenate([np.stack(past), self.ci], axis=1)
             self.hist0 = self.ci_hist.shape[1] - self.ci.shape[1]
 

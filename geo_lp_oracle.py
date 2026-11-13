@@ -16,11 +16,22 @@ Starts may also fall up to `late_steps` after a class's latest start, with a lar
 schedule can absorb on time keep the LP feasible (the simulator lets such jobs start late too). The reported bound is
 the CO2 term only.
 
+Overflow: a burst that cannot be placed even `late_steps` late (e.g. origin-only `time`, or start-on-arrival `geo`,
+in a busy hour) would make the LP infeasible. Each class therefore has one overflow variable v[c] (the share of the
+class not placed in the window) with an even larger penalty, so it is only used when nothing else fits. Overflow work
+uses no capacity and is charged a lower bound on its CO2: its load-steps x the lowest CI x marginal energy at zero
+load over all of its allowed sites and steps (the energy curve is convex, so the marginal energy at any load is at
+least the one at zero load). The result stays a valid lower bound; `overflow_job_mwh` reports how much work used it.
+
+Solver: HiGHS interior point by default; if it stops with an error (not infeasibility), the solve is retried with the
+dual simplex.
+
 Variants (allowed starts):
     geo_time   any site, any step in [arrival, latest start]          the bound
     geo        any site, start on arrival                             value of moving work in space only
     time       origin only, any step in [arrival, latest start]       value of moving work in time only
-    local      origin only, on arrival                                no flexibility (sanity check vs the simulator)
+    local      origin only, on arrival                                no flexibility (sanity check vs the simulator;
+                                                                      bursts overflow here, so it reads optimistic)
 """
 import time
 
@@ -138,9 +149,11 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
             xs_late.append(np.maximum(starts - (a if cls['rigid'][c] else last), 0))
     xc, xi, xs, xlate = (np.concatenate(v) for v in (xs_c, xs_i, xs_s, xs_late))
     nx = len(xc)
+    n_cls = len(cls['arrival'])
     iu = nx + np.arange(N * T)            # u[i, t] -> iu[i*T + t]
     iz = nx + N * T + np.arange(N * T)
-    nvar = nx + 2 * N * T
+    iv = nx + 2 * N * T + np.arange(n_cls)  # overflow share of each class
+    nvar = nx + 2 * N * T + n_cls
 
     # objective: CO2 (g) + lateness penalty (g-equivalent)
     penalty = 10.0 * float((ci[:, :, None] * slope).max())  # per unit-load-step started late
@@ -148,13 +161,24 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
     c_obj[iz] = ci.reshape(-1)
     late_w = cls['occ_prof'][xc, 0] / cap_w[xi]  # size of the class at its site
     c_obj[:nx] = penalty * xlate * late_w
+    # Overflow: CO2 lower bound of the class (load-steps x min over allowed sites and steps of CI x zero-load slope),
+    # plus a penalty above that of the latest allowed start.
+    floor_cost = ci * slope[:, :, 0]                      # (N, T): g per unit load for one step at zero load
+    floor_any = floor_cost.min(axis=1)                    # (N,)
+    load_steps = cls['util_prof'].sum(1)[:, None] / cap_w[None, :]   # (classes, N)
+    allowed = np.where(cls['origin'][:, None] < 0, True, np.arange(N)[None, :] == cls['origin'][:, None])
+    co2_floor = np.where(allowed, load_steps * floor_any[None, :], np.inf).min(axis=1)
+    # Above the latest allowed start's penalty and above the CO2 of running the class at any site and time (`penalty`
+    # is 10x the largest CI x slope), so overflow never pays when a placement exists.
+    size = (cls['occ_prof'][:, 0][:, None] / cap_w[None, :]).max(axis=1)
+    over_pen = 10 * penalty * ((late_steps + 1) * size + load_steps.max(axis=1))
+    c_obj[iv] = co2_floor + over_pen
 
     rows_eq, cols_eq, vals_eq, b_eq = [], [], [], []
     # every class starts once
-    rows_eq.append(xc)
-    cols_eq.append(np.arange(nx))
-    vals_eq.append(np.ones(nx))
-    n_cls = len(cls['arrival'])
+    rows_eq.append(np.concatenate([xc, np.arange(n_cls)]))
+    cols_eq.append(np.concatenate([np.arange(nx), iv]))
+    vals_eq.append(np.ones(nx + n_cls))
     b_eq.append(np.ones(n_cls))
     # u definition: u[i,t] - sum x * util_prof[t - s] / cap_i = 0
     r_u, c_u, v_u = [iu - nx], [iu], [np.ones(N * T)]  # row index (i*T + t), offset by n_cls below
@@ -195,19 +219,28 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
     bounds[iu, 1] = 1.0
     t_build = time.time() - t_start
     res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method=method)
+    used = method
+    if res.status not in (0, 2) and method != 'highs-ds':  # solver error (not infeasibility): retry with dual simplex
+        if verbose:
+            print(f'[lp {variant}] {method} failed ({res.message}); retrying with highs-ds')
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs-ds')
+        used = 'highs-ds'
     out = {'variant': variant, 'status': res.status, 'message': res.message, 'n_vars': nvar, 'n_classes': n_cls,
-           'build_s': t_build, 'solve_s': time.time() - t_start - t_build}
+           'method': used, 'build_s': t_build, 'solve_s': time.time() - t_start - t_build}
     if res.status != 0:
         if verbose:
             print(f'[lp {variant}] failed: {res.message}')
         out['co2_kg'] = float('nan')
         return out
     x = res.x
-    out['co2_kg'] = float(ci.reshape(-1) @ x[iz]) / 1e3
+    out['co2_kg'] = float(ci.reshape(-1) @ x[iz] + co2_floor @ x[iv]) / 1e3
+    out['overflow_co2_kg'] = float(co2_floor @ x[iv]) / 1e3
     job_mwh = cls['util_prof'].sum(1)[xc] * STEP_HOURS / 1e6  # MWh of the class
     out['late_job_mwh'] = float(np.sum(x[:nx] * job_mwh * (xlate > 0)))
+    out['overflow_job_mwh'] = float(np.sum(x[iv] * cls['util_prof'].sum(1) * STEP_HOURS / 1e6))
     out['util'] = x[iu].reshape(N, T).T  # (T, N)
     if verbose:
         print(f"[lp {variant}] {out['co2_kg']:.1f} kg, {n_cls} classes, {nvar} vars, build {t_build:.0f}s, "
-              f"solve {out['solve_s']:.0f}s, late {out['late_job_mwh']:.2f} MWh")
+              f"solve {out['solve_s']:.0f}s ({used}), late {out['late_job_mwh']:.2f} MWh, "
+              f"overflow {out['overflow_job_mwh']:.2f} MWh")
     return out
