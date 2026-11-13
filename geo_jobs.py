@@ -27,6 +27,18 @@ Each 15-minute step:
   5. each site's utilization = sum over running jobs of size x (fraction of this step it runs): a 40-min job of 2%
      adds 2%, 2%, 1.33%; the site's DC model runs with it (SustainDC.set_external_utilization).
 
+Routing modes (`routing`):
+  * 'pool' (default): the steps above. Pending jobs form one fleet-wide pool; the dispatcher decides both where and
+    when, and a due job falls back to the site with most room if its origin is full.
+  * 'site_queue': where and when are split, so each site has its own controlled state (a restless arm):
+      a. every job is routed to one site's queue in the step it arrives (action['route']; rigid jobs: origin;
+         missing / -1: origin), and never moves again;
+      b. each site starts jobs from its own queue (action['starts']: per site, the queued jobs to start now, in order;
+         None = earliest deadline first whenever a job fits);
+      c. a queued job at its latest start is force-started at its own site if there is room, else it keeps waiting
+         (an SLA violation): no fallback to another site.
+    Utilization, physics and metrics are the same as in 'pool'.
+
 Usage:
     geo = GeoJobsDC({'sites': [{'location': 'dcc:US-CAL-CISO'}, {'location': 'dcc:DE-LU'}], 'target_util': 0.5})
     geo.reset()
@@ -54,7 +66,9 @@ JOB_DEFAULTS = {
     'rigid_fraction': 0.0,     # jobs that must start at their origin on arrival
     'cap': 1.0,                # max committed load per site (fraction of capacity)
     'jobs_file': JOBS_FILE,
+    'routing': 'pool',         # 'pool' or 'site_queue' (see the module docstring)
 }
+ROUTING_MODES = ('pool', 'site_queue')
 
 _TRACE = {}
 
@@ -93,6 +107,9 @@ class GeoJobsDC(GeoSustainDC):
         self.trace = load_trace(self.job_cfg['jobs_file'])
         self.cap_w = self.capacity_mw * 1e6
         self.cap = float(self.job_cfg['cap'])
+        self.routing = self.job_cfg['routing']
+        if self.routing not in ROUTING_MODES:
+            raise ValueError(f"routing must be one of {ROUTING_MODES}, got {self.routing!r}")
         sla = float(self.job_cfg['sla_multiplier'])
         if sla < 1.0:
             raise ValueError(f'sla_multiplier must be >= 1, got {sla}')
@@ -114,6 +131,8 @@ class GeoJobsDC(GeoSustainDC):
         self.start_step = np.full(self.n_jobs, -1, dtype=np.int64)
         self.end_step = np.full(self.n_jobs, np.inf)
         self.forced = np.zeros(self.n_jobs, dtype=bool)
+        self.active = np.zeros(0, dtype=np.int64)            # jobs with status 1 or 2, increasing index
+        self._groups = None                                  # per-site queues / running jobs, rebuilt on change
         self._arrive()
         self.totals = {'co2_kg': 0.0, 'energy_mwh': 0.0, 'it_mwh': 0.0, 'hvac_mwh': 0.0, 'water_l': 0.0}
         self.util_history = []
@@ -154,18 +173,46 @@ class GeoJobsDC(GeoSustainDC):
         j1 = int(np.searchsorted(self.arrival, self.t, side='right'))
         self.status[j0:j1] = 1
         self._arr_ptr = j1
+        if j1 > j0:
+            self.active = np.r_[self.active, np.arange(j0, j1)]
+            self._groups = None
+
+    # -- active-job bookkeeping (everything below scans the arrived, unfinished jobs only) ---------------------------
+    def site_groups(self):
+        """{'queue': per site, its waiting jobs (earliest latest-start first), 'running': per site, its running jobs,
+        'unrouted': waiting jobs without a site (arrival order)}. Cached until a job arrives, starts, ends or is routed."""
+        if self._groups is None:
+            a = self.active
+            st, si = self.status[a], self.site[a]
+            run = a[st == 2]
+            wait = a[(st == 1) & (si >= 0)]
+            wait = wait[np.lexsort((self.latest_start[wait], self.site[wait]))]     # by site, then latest start
+            g = {'queue': np.split(wait, np.searchsorted(self.site[wait], np.arange(1, self.n_sites))),
+                 'running': [], 'unrouted': a[(st == 1) & (si < 0)]}
+            run = run[np.argsort(self.site[run], kind='stable')]
+            g['running'] = np.split(run, np.searchsorted(self.site[run], np.arange(1, self.n_sites)))
+            self._groups = g
+        return self._groups
+
+    def running(self, i=None):
+        """Running jobs (of site i, or all), increasing index."""
+        if i is None:
+            a = self.active
+            return a[self.status[a] == 2]
+        return np.sort(self.site_groups()['running'][i])
 
     # -----------------------------------------------------------------------------------------------------------------
     def committed_load(self):
         """Per-site load committed by running jobs during the current step (capacity check)."""
-        run = np.flatnonzero(self.status == 2)
+        run = self.running()
         load = np.zeros(self.n_sites)
         np.add.at(load, self.site[run], self.size[run, self.site[run]])
         return load
 
     def pending_jobs(self):
         """Indices of pending jobs, earliest latest-start first."""
-        p = np.flatnonzero(self.status == 1)
+        a = self.active
+        p = a[self.status[a] == 1]
         return p[np.argsort(self.latest_start[p], kind='stable')]
 
     def pending_view(self):
@@ -184,6 +231,7 @@ class GeoJobsDC(GeoSustainDC):
         load[i] += self.size[j, i]
         self.status[j], self.site[j], self.start_step[j] = 2, i, self.t
         self.end_step[j] = self.t + self.dur[j]
+        self._groups = None
         return True
 
     def schedule(self, assign):
@@ -216,9 +264,50 @@ class GeoJobsDC(GeoSustainDC):
                         self.forced[j] = True
                         break
 
+    # -- site_queue mode ------------------------------------------------------------------------------------------
+    def arrivals(self):
+        """Jobs that arrived and are not routed yet (site_queue mode: this step's arrivals), in arrival order."""
+        return self.site_groups()['unrouted']
+
+    def queue(self, i):
+        """Jobs waiting in site i's queue, earliest latest-start first."""
+        return self.site_groups()['queue'][i]
+
+    def route(self, route):
+        """Route this step's arrivals to site queues. `route`: site per job of arrivals() (-1 = origin), or a dict
+        {job: site}, or None (everyone to its origin). Rigid jobs always go to their origin."""
+        arr = self.arrivals()
+        if isinstance(route, dict):
+            dest = np.array([route.get(int(j), -1) for j in arr], dtype=np.int64)
+        elif route is None:
+            dest = np.full(len(arr), -1, dtype=np.int64)
+        else:
+            dest = np.asarray(route, dtype=np.int64).reshape(-1)
+            if len(dest) != len(arr):
+                raise ValueError(f'route has {len(dest)} entries for {len(arr)} arrivals')
+        bad = (dest < 0) | (dest >= self.n_sites) | self.rigid[arr]
+        dest[bad] = self.origin[arr[bad]]
+        self.site[arr] = dest
+        self._groups = None
+
+    def start_local(self, starts):
+        """Start queued jobs at their own sites. `starts`: per site, a list of queued jobs to start now (tried in
+        order; jobs that do not fit stay queued), or None for earliest-deadline-first. Then force-start due jobs at
+        their own site when they fit."""
+        load = self.committed_load()
+        for i in range(self.n_sites):
+            q = self.queue(i)
+            todo = q if starts is None or starts[i] is None else [j for j in starts[i] if self.status[j] == 1 and self.site[j] == i]
+            for j in todo:
+                self._try_start(int(j), i, load)
+            q = q[self.status[q] == 1]
+            for j in q[self.latest_start[q] < self.t + 1]:
+                if self._try_start(int(j), i, load):
+                    self.forced[j] = True
+
     def utilization(self):
         """Per-site utilization of the current step: running jobs x the fraction of the step they run."""
-        run = np.flatnonzero(self.status == 2)
+        run = self.running()
         frac = np.clip(self.end_step[run] - self.t, 0.0, 1.0)
         u = np.zeros(self.n_sites)
         np.add.at(u, self.site[run], self.size[run, self.site[run]] * frac)
@@ -226,8 +315,13 @@ class GeoJobsDC(GeoSustainDC):
 
     # -----------------------------------------------------------------------------------------------------------------
     def step(self, action):
-        """action: {'assign': per pending job site or -1 (see schedule), 'sites': [site action dict] * N or None}."""
-        self.schedule(action.get('assign'))
+        """action: {'assign': per pending job site or -1 (see schedule), 'sites': [site action dict] * N or None}
+        in 'pool' mode; {'route': ..., 'starts': ..., 'sites': ...} in 'site_queue' mode (see route, start_local)."""
+        if self.routing == 'site_queue':
+            self.route(action.get('route'))
+            self.start_local(action.get('starts'))
+        else:
+            self.schedule(action.get('assign'))
         u = self.utilization()
         self.util_history.append(u)
         site_actions = action.get('sites') or [dict(NOOP)] * self.n_sites
@@ -246,7 +340,12 @@ class GeoJobsDC(GeoSustainDC):
             self.totals['hvac_mwh'] += common['dc_HVAC_total_power_kW'] * STEP_HOURS / 1e3
             self.totals['water_l'] += common['dc_water_usage']
         self.t += 1
-        self.status[(self.status == 2) & (self.end_step <= self.t)] = 3
+        a = self.active
+        done = a[(self.status[a] == 2) & (self.end_step[a] <= self.t)]
+        self.status[done] = 3
+        if len(done):
+            self.active = a[self.status[a] != 3]
+            self._groups = None
         self._arrive()
         truncated |= self.t >= self.horizon
         info = {'sites': site_info, 'utilization': u}

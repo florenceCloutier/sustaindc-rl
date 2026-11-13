@@ -196,3 +196,78 @@ def run_job_episode(geo, dispatcher, seed, local_spec='noop'):
     m = geo.episode_metrics()
     m['steps'] = steps
     return m
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# site_queue mode (GeoJobsDC(routing='site_queue')): route each arrival to a site's queue; sites start jobs themselves
+# ---------------------------------------------------------------------------------------------------------------------
+JOB_ROUTERS = ('origin', 'greedy_ci', 'merit')
+
+
+class JobRouter:
+    """Routes this step's arrivals to site queues, using only the current state:
+        origin     every job to its origin (with earliest-deadline-first starts, the site_queue version of `local`)
+        greedy_ci  the lowest-current-CI site whose committed + queued load leaves room for the job
+        merit      the same with the marginal CO2 now (CI x marginal IT + cooling energy, as `merit`)
+    If no site has room, the job goes to the one with the least committed + queued load (it waits there)."""
+
+    def __init__(self, kind):
+        if kind not in JOB_ROUTERS:
+            raise ValueError(f'Unknown router {kind!r}; choose from {JOB_ROUTERS}')
+        self.kind = kind
+
+    def reset(self, geo):
+        if self.kind != 'origin':
+            self.n = geo.horizon + 2
+            self.ci, _, self.A = marginal_table(geo, self.n)
+
+    def route(self, geo):
+        arr = geo.arrivals()
+        out = np.full(len(arr), -1, dtype=np.int64)
+        if self.kind == 'origin' or len(arr) == 0:
+            return out
+        proj = geo.committed_load()
+        for i in range(geo.n_sites):
+            proj[i] += geo.size[geo.queue(i), i].sum()
+        score = (self.ci if self.kind == 'greedy_ci' else self.A)[:, geo.t]
+        order = np.argsort(score)
+        for k in np.argsort(geo.latest_start[arr], kind='stable'):
+            j = arr[k]
+            if geo.rigid[j]:
+                i = geo.origin[j]
+            else:
+                fits = [i for i in order if proj[i] + geo.size[j, i] <= geo.cap + 1e-12]
+                i = fits[0] if fits else int(np.argmin(proj))
+            out[k] = i
+            proj[i] += geo.size[j, i]
+        return out
+
+
+def run_queue_episode(geo, router, seed, local_spec='noop', scheduler=None):
+    """One seeded episode in site_queue mode: `router.route(geo)` routes arrivals, `scheduler` (None = earliest
+    deadline first) starts queued jobs: scheduler.starts(geo) -> per-site lists. Returns geo.episode_metrics()."""
+    import random
+    from eval_compare import make_policy
+    assert geo.routing == 'site_queue', 'run_queue_episode needs GeoJobsDC(routing="site_queue")'
+    random.seed(seed)
+    np.random.seed(seed)
+    geo.reset()
+    router.reset(geo)
+    if scheduler is not None:
+        scheduler.reset(geo)
+    local = [make_policy(local_spec)[1] for _ in range(geo.n_sites)]
+    for k, p in enumerate(local):
+        p.reset(seed + 1000 * k)
+    steps = 0
+    while True:
+        route = router.route(geo)
+        geo.route(route)
+        starts = scheduler.starts(geo) if scheduler is not None else None
+        _, _, _, truncated, _ = geo.step({'route': None, 'starts': starts,
+                                          'sites': [p.act(s) for p, s in zip(local, geo.sites)]})
+        steps += 1
+        if truncated:
+            break
+    m = geo.episode_metrics()
+    m['steps'] = steps
+    return m

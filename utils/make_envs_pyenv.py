@@ -61,7 +61,8 @@ def design_weather(location):
     weather_file = obtain_paths(location)[1]
     data = pd.read_csv(os.path.join(REPO_PATH, 'data', 'Weather', weather_file), skiprows=8, header=None).values
     dry, rh, pres = data[:, 6].astype(float), data[:, 8].astype(float), data[:, 9].astype(float)
-    wet = np.array([psy.GetTWetBulbFromRelHum(t, min(max(h, 0.0), 100.0) / 100, p) for t, h, p in zip(dry, rh, pres)])
+    from utils.managers import wet_bulb_series
+    wet = wet_bulb_series(dry, rh, pres, clip_rh=True)
     return float(np.percentile(dry, TOWER_DESIGN_DRY_BULB_PERCENTILE)), float(wet.max()) + CHILLER_WET_BULB_MARGIN
 
 

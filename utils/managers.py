@@ -6,6 +6,20 @@ import psychrolib as psy
 file_path = os.path.abspath(__file__)
 PATH = os.path.split(os.path.dirname(file_path))[0]
 
+_WET_BULB_CACHE = {}
+
+
+def wet_bulb_series(dry, rh, pres, clip_rh=False):
+    """Wet bulb (C) per hour from dry bulb (C), relative humidity (%) and pressure (Pa), with psychrolib (SI).
+    Memoized on the data: many sites share a weather file, and psychrolib takes ~1 s per year of hours."""
+    dry, rh, pres = (np.asarray(a, dtype=float) for a in (dry, rh, pres))
+    key = (dry.tobytes(), rh.tobytes(), pres.tobytes(), bool(clip_rh))
+    if key not in _WET_BULB_CACHE:
+        psy.SetUnitSystem(psy.SI)
+        h = np.clip(rh, 0.0, 100.0) if clip_rh else rh
+        _WET_BULB_CACHE[key] = np.array([psy.GetTWetBulbFromRelHum(t, x / 100, p) for t, x, p in zip(dry, h, pres)])
+    return _WET_BULB_CACHE[key]
+
 # Set the unit system for psychrolib
 psy.SetUnitSystem(psy.SI)
 
@@ -556,7 +570,7 @@ class Weather_Manager():
         relative_humidity_data = weather_data[:,rh_column].astype(float)  # Added for relative humidity
         pressure_data = weather_data[:,pres_column].astype(float)  # Added for atmospheric pressure
                 
-        self.wet_bulb_data = [psy.GetTWetBulbFromRelHum(t, rh / 100, p) for t, rh, p in zip(temperature_data, relative_humidity_data, pressure_data)]
+        self.wet_bulb_data = list(wet_bulb_series(temperature_data, relative_humidity_data, pressure_data))
 
         # Normalize wet bulb temperature data
         self.min_wb_temp = 0
