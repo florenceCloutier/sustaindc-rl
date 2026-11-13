@@ -15,11 +15,21 @@ Each iteration also runs `noop` on the same seeds and reports the paired change 
 whether the policy improves from one iteration to the next. The last round only runs the last value (no fit). The value
 of the best round on these training episodes is copied to value.npz.
 
+Logging and model selection use the common suite (sdc_eval/), like every other trainer: rollout/* (each training
+episode's physical metrics), health/value_fit_<head>/* (rho, target std, R2 train/val), perf/*, and eval/*: each
+iteration's MPC (without exploration) is evaluated on the fixed TRAIN_EVAL_SEED episodes (disjoint from the training
+and the final eval_compare seeds); value.npz = the value of the best evaluation (lowest work-adjusted CO2 among those
+that don't drop more tasks than noop). env_steps = environment steps of MPC data collected so far.
+
+Hyperparameters: flags, or --config <yaml> (sections env: and algo:, algo keys = the flag names) and
+--set algo.H=24 (sdc_eval/config.py). Runs go to <out_root>/sustaindc/<location>/mpc/<exp_name>/seed-XXXXX-<run_id>
+(out_root: --out_root, else $SDC_OUT_ROOT, else ./results), or to --out_dir if given.
+
 Example (16 CPUs):
-    python train_mpc_value.py --location az --out_dir runs/mpc_value/az --iters 4 --episodes 32 --workers 16
+    python train_mpc_value.py --location az --iters 4 --episodes 32 --workers 16 --exp_name per_unit
 Then evaluate:
     python eval_compare.py --location az --n_episodes 10 --policy noop \\
-        --policy mpc:value=runs/mpc_value/az/value.npz=mpc_learned
+        --policy mpc:value=<run_dir>/value.npz=mpc_learned
 """
 import argparse
 import json
@@ -37,8 +47,17 @@ import numpy as np
 import torch
 import yaml
 
-ENV_CFG = 'harl/configs/envs_cfgs/sustaindc.yaml'
-STEP_HOURS = 0.25
+from sdc_eval.constants import ENV_CFG, MPC_TRAIN_SEED, STEP_HOURS, TRAIN_EVAL_SEED
+from sdc_eval.metrics import EpisodeAccumulator
+from sdc_eval.config import add_config_args, explicit_dests, resolve_hparams
+from sdc_eval.evaluator import FixedSeedEvaluator
+from sdc_eval.logger import RunLogger
+from sdc_eval.paths import resolve_root, run_dir as run_dir_for
+from sdc_eval.rollout import reset_reward_history
+
+# Flags that are hyperparameters of the method (config section 'algo').
+ALGO_KEYS = ('iters', 'episodes', 'seed', 'H', 'forecast', 'dc_setpoint', 'explore', 'nstep', 'fits', 'val_episodes',
+             'init_value', 'form')
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -53,7 +72,8 @@ def make_env(scenario):
 def collect_episode(job):
     """Run one MPC episode and the noop episode with the same seed. Returns recorded arrays and metrics."""
     import mpc_value as M
-    from eval_compare import NoOpPolicy, run_episode, marginal_kwh_per_util_step
+    from sdc_eval.policies import NoOpPolicy
+    from sdc_eval.rollout import run_episode
     torch.set_num_threads(1)
     scenario, seed, mpc_kwargs = job['scenario'], job['seed'], job['mpc']
     sdc = make_env(scenario)
@@ -62,37 +82,44 @@ def collect_episode(job):
     policy = M.MPCPolicy(record=True, **mpc_kwargs)
     random.seed(seed)
     np.random.seed(seed)
+    reset_reward_history()
     sdc.reset()
     policy.reset(seed)
     rec = {k: [] for k in ('queue', 'q', 'soc', 'ctx', 'd_ls', 'd_bat', 'task_cost', 'ci')}
-    co2 = submitted = executed = ci_sum = amb_sum = dropped = 0.0
+    acc = EpisodeAccumulator(record_inputs=False)  # the common per-episode metrics (sdc_eval.metrics)
+    submitted = ci_sum = 0.0
     steps = 0
+    plan_time = 0.0
     t0 = time.time()
     while True:
+        t_plan = time.time()
         actions = policy.act(sdc)
+        plan_time += time.time() - t_plan
         last = policy.last
         _, _, _, truncs, info = sdc.step(actions)
         i = info['agent_ls']
-        ci, coef = i['bat_avg_CI'], last['coef']
+        acc.step(i, actions, (sdc.ls_reward, sdc.dc_reward, sdc.bat_reward))
+        ci, coef, pv = i['bat_avg_CI'], last['coef'], last['pv']
         u, w = i['ls_shifted_workload'], i['ls_original_workload']
-        d_ls = ci * (M.energy_kwh(coef, u) - M.energy_kwh(coef, w)) / 1e3
+        pv_kwh = i.get('pv_energy_KWh', 0.0)  # the PV of this step
+        # Load shifting: CO2 of the executed vs submitted energy with this step's PV, battery idle (no PV: E x CI).
+        d_ls = float(M.grid_co2_kg(M.energy_kwh(coef, u), ci, pv_kwh, pv) - M.grid_co2_kg(M.energy_kwh(coef, w), ci, pv_kwh, pv))
         d_ls += M.DROP_PENALTY * i['ls_tasks_dropped'] * M.task_kwh(coef, u) * ci / 1e3
-        d_bat = ci * (i['bat_total_energy_with_battery_KWh'] - i['bat_total_energy_without_battery_KWh']) / 1e3
-        task_cost = M.task_kwh(coef, u) * ci / 1e3  # kg CO2 of one task run at this step
+        # Battery: the step's CO2 minus that of the same load with the battery idle (and PV used as in grid_co2_kg).
+        load_kwh = i['bat_total_energy_without_battery_KWh']
+        d_bat = i['bat_CO2_footprint'] / 1e3 -float(M.grid_co2_kg(load_kwh, ci, pv_kwh, pv)) if pv[0] != 'off' \
+            else ci * (i['bat_total_energy_with_battery_KWh'] - load_kwh) / 1e3
+        task_cost = M.marginal_task_co2_kg(coef, u, ci, pv_kwh, pv)  # kg CO2 of one more task run at this step
         for k, v in (('queue', last['queue']), ('q', last['q']), ('soc', last['soc']), ('ctx', last['ctx']),
                      ('d_ls', d_ls), ('d_bat', d_bat), ('task_cost', task_cost), ('ci', ci)):
             rec[k].append(v)
-        co2 += i['bat_CO2_footprint'] / 1e3
         submitted += w
-        executed += u
-        dropped += i['ls_tasks_dropped']
         ci_sum += ci
-        amb_sum += i['outside_temp']
         steps += 1
         if truncs['__all__']:
             break
-    unexecuted = max(submitted - executed, 0.0)
-    co2_adj = co2 + unexecuted * marginal_kwh_per_util_step(sdc, submitted / steps, amb_sum / steps) * (ci_sum / steps) / 1e3
+    episode_metrics = acc.finalize(sdc)
+    co2_adj = episode_metrics['co2_work_adjusted']
     data = {k: np.asarray(v, dtype=np.float64) for k, v in rec.items()}
     # end of episode: queued work is charged like eval_compare.py does (marginal energy x mean CI); stored energy is lost
     data['q_final'] = M.queue_counts(sdc.ls_env)
@@ -102,8 +129,10 @@ def collect_episode(job):
     data['end_task_cost'] = float(M.task_kwh(policy.last['coef'], submitted / steps) * ci_sum / steps / 1e3)
     data['cap'] = float(sdc.bat_env.max_bat_cap)
     metrics = {'seed': seed, 'co2_work_adjusted': co2_adj, 'noop_co2_work_adjusted': noop['co2_work_adjusted'],
-               'change_pct': 100 * (co2_adj / noop['co2_work_adjusted'] - 1), 'dropped': dropped,
-               'queued_end': float(i['ls_tasks_in_queue']), 'seconds': time.time() - t0, 'steps': steps}
+               'change_pct': 100 * (co2_adj / noop['co2_work_adjusted'] - 1),
+               'dropped': episode_metrics['tasks_dropped'], 'queued_end': episode_metrics['tasks_queued_end'],
+               'seconds': time.time() - t0, 'steps': steps, 'plan_ms_per_step': 1e3 * plan_time / steps,
+               'episode_metrics': episode_metrics}
     return data, metrics
 
 
@@ -191,7 +220,7 @@ def per_unit_targets(ep):
                 ys.append((csum[hi] - csum[lo]) / (hi - lo))
                 ws.append(hi - lo)
     xs = np.array(xs, dtype=float).reshape(-1, 3)
-    x_ls = M.per_task_inputs(xs[:, 1], ctx[xs[:, 2].astype(int)]) if len(xs) else np.zeros((0, M.N_BUCKETS + 13))
+    x_ls = M.per_task_inputs(xs[:, 1], ctx[xs[:, 2].astype(int)]) if len(xs) else np.zeros((0, M.N_BUCKETS + 1 + ctx.shape[1]))
     # per_task_inputs returns all buckets per row; keep the one of each sample
     if len(xs):
         x_ls = x_ls.reshape(len(xs), M.N_BUCKETS, -1)[np.arange(len(xs)), xs[:, 0].astype(int)]
@@ -311,10 +340,19 @@ def main():
     p.add_argument('--location', required=True)
     p.add_argument('--month', type=int, default=None, help='Default: the env config month (6, July).')
     p.add_argument('--days_per_episode', type=int, default=30)
-    p.add_argument('--out_dir', required=True)
+    p.add_argument('--pv_capacity_kWp', type=float, default=None,
+                   help="On-site PV capacity (pv_config.capacity_kWp; 0 = no PV). Default: the env yaml.")
+    p.add_argument('--include_pv', action=argparse.BooleanOptionalAction, default=None,
+                   help="--include_pv: PV on and dispatched by the battery's PV action (use/battery/resell; needs "
+                        "--pv_capacity_kWp > 0). --no-include_pv: no PV. Default: the env yaml (automatic PV rule).")
+    p.add_argument('--exp_name', default='mpc_value')
+    p.add_argument('--run_id', default=None, help='Run directory suffix (default: a timestamp).')
+    p.add_argument('--out_root', default=None, help='Output root (default: $SDC_OUT_ROOT if set, else ./results).')
+    p.add_argument('--out_dir', default=None, help='Write the run here instead of the standard run directory.')
+    add_config_args(p)
     p.add_argument('--iters', type=int, default=4, help='Policy-iteration rounds (data collection + fit).')
     p.add_argument('--episodes', type=int, default=32, help='Training episodes per iteration.')
-    p.add_argument('--seed', type=int, default=3000, help='Training episodes use seeds seed, seed+1, ...')
+    p.add_argument('--seed', type=int, default=MPC_TRAIN_SEED, help='Training episodes use seeds seed, seed+1, ...')
     p.add_argument('--workers', type=int, default=os.cpu_count())
     p.add_argument('--H', type=int, default=16)
     p.add_argument('--forecast', default='realistic')
@@ -326,17 +364,51 @@ def main():
     p.add_argument('--init_value', default='naive', help='Terminal value of iteration 0 (naive or a .npz).')
     p.add_argument('--form', default='per_unit', choices=['per_unit', 'mlp'],
                    help='per_unit: learned per-task / per-MWh values (Monte Carlo); mlp: unstructured n-step values.')
+    p.add_argument('--n_eval_episodes', type=int, default=5,
+                   help='Fixed-seed evaluation episodes per iteration (seeds TRAIN_EVAL_SEED + i); 0 = no evaluation '
+                        '(value.npz then falls back to the best iteration on its own training episodes).')
+    p.add_argument('--eval_days', type=int, default=None, help='Days per evaluation episode (default: days_per_episode).')
+    p.add_argument('--save_decisions', action=argparse.BooleanOptionalAction, default=True,
+                   help='Save the per-step decisions of every evaluation to <run>/eval/decisions/.')
+    p.add_argument('--drop_tolerance', type=float, default=1.0,
+                   help='Best-model guard: max mean tasks dropped per eval episode above noop.')
     args = p.parse_args()
 
+    # Hyperparameters: defaults < --config < explicit flags < --set (sdc_eval/config.py)
     with open(ENV_CFG) as f:
         scenario = yaml.safe_load(f)
     scenario['location'] = args.location
     scenario['days_per_episode'] = args.days_per_episode
     if args.month is not None:
         scenario['month'] = args.month
-    os.makedirs(args.out_dir, exist_ok=True)
-    with open(os.path.join(args.out_dir, 'args.json'), 'w') as f:
+    if args.pv_capacity_kWp is not None:
+        scenario['pv_config'] = {**(scenario.get('pv_config') or {}), 'capacity_kWp': args.pv_capacity_kWp}
+    if args.include_pv is not None:
+        scenario['include_pv'] = args.include_pv
+    explicit = explicit_dests(p, sys.argv[1:])
+    env_flags = {'location': 'location', 'days_per_episode': 'days_per_episode', 'month': 'month',
+                 'pv_capacity_kWp': 'pv_config', 'include_pv': 'include_pv'}
+    hp = resolve_hparams(
+        {'env': scenario, 'algo': {k: getattr(args, k) for k in ALGO_KEYS}}, args.config, args.overrides,
+        explicit=[('algo', k) for k in ALGO_KEYS if k in explicit] +
+                 [('env', key) for flag, key in env_flags.items() if flag in explicit])
+    scenario = hp['env']
+    for k, v in hp['algo'].items():
+        setattr(args, k, v)
+
+    out_dir = args.out_dir or run_dir_for(resolve_root(args.out_root), scenario['location'], 'mpc', args.exp_name,
+                                          args.seed, args.run_id)
+    os.makedirs(out_dir, exist_ok=True)
+    print(f'Run dir: {out_dir}', flush=True)
+    with open(os.path.join(out_dir, 'args.json'), 'w') as f:
         json.dump({**vars(args), 'scenario': scenario}, f, indent=2)
+    rl = RunLogger(out_dir, 'mpc', 'mpc', env_cfg=scenario, seed=args.seed,
+                   hparams={'algo': hp['algo'], 'env': scenario,
+                            'eval': {'n_eval_episodes': args.n_eval_episodes, 'eval_days': args.eval_days}})
+    evaluator = (FixedSeedEvaluator(scenario, out_dir, rl, n_episodes=args.n_eval_episodes, seed=TRAIN_EVAL_SEED,
+                                    drop_tolerance=args.drop_tolerance, days_per_episode=args.eval_days,
+                                    save_decisions=args.save_decisions)
+                 if args.n_eval_episodes > 0 else None)
 
     from mpc_value import DAY
     sdc = make_env(scenario)
@@ -345,6 +417,8 @@ def main():
 
     value = args.init_value
     history = []
+    env_steps = 0
+    t_start = time.time()
     ctx = mp.get_context('fork')
     with ctx.Pool(args.workers) as pool:
         for it in range(args.iters + 1):
@@ -356,16 +430,36 @@ def main():
             t0 = time.time()
             results = pool.map(collect_episode, [{'scenario': scenario, 'seed': s, 'mpc': mpc_kwargs} for s in seeds])
             metrics = [m for _, m in results]
+            for m in metrics:  # rollout/*: each training episode, in seed order
+                env_steps += m['steps']
+                rl.episode(m['episode_metrics'], env_steps)
             ch = np.array([m['change_pct'] for m in metrics])
             half = 1.96 * ch.std(ddof=1) / np.sqrt(len(ch)) if len(ch) > 1 else float('nan')
-            entry = {'iteration': it, 'value': value, 'explore': mpc_kwargs['explore'],
+            entry = {'iteration': it, 'value': value, 'explore': mpc_kwargs['explore'], 'env_steps': env_steps,
                      'change_pct_mean': float(ch.mean()), 'change_pct_ci95': float(half),
                      'dropped_mean': float(np.mean([m['dropped'] for m in metrics])),
                      'queued_end_mean': float(np.mean([m['queued_end'] for m in metrics])),
-                     'minutes': (time.time() - t0) / 60, 'episodes': metrics}
+                     'minutes': (time.time() - t0) / 60,
+                     'episodes': [{k: v for k, v in m.items() if k != 'episode_metrics'} for m in metrics]}
             print(f'  work-adjusted CO2 vs noop on these episodes: {ch.mean():+.2f}% ± {half:.2f} '
                   f'(dropped {entry["dropped_mean"]:.0f}, queued at end {entry["queued_end_mean"]:.0f}; '
                   f'{entry["minutes"]:.1f} min)', flush=True)
+            rl.scalars('rollout', {'co2_work_adjusted_pct_vs_noop': entry['change_pct_mean']}, env_steps)
+            rl.scalars('health', {'iteration': it}, env_steps)
+            rl.scalars('perf', {'collect_minutes': entry['minutes'], 'wall_time': time.time() - t_start,
+                                'plan_ms_per_step': float(np.mean([m['plan_ms_per_step'] for m in metrics]))},
+                       env_steps)
+            if evaluator is not None:
+                # this iteration's value, without exploration, on the fixed evaluation episodes
+                spec = (f"mpc:H={args.H},value={value},forecast={args.forecast},dc_setpoint={args.dc_setpoint},"
+                        f"explore=0")
+                out = evaluator.evaluate(None, env_steps, save_fn=lambda tag, v=value: save_value(out_dir, v),
+                                         spec=spec, pool=pool)
+                entry['eval'] = {k: out[k] for k in ('co2_work_adjusted', 'co2_work_adjusted_pct_vs_noop',
+                                                     'tasks_dropped', 'eligible')}
+                print(f"  fixed-seed eval: {out['co2_work_adjusted_pct_vs_noop']:+.2f}% vs noop, dropped "
+                      f"{out['tasks_dropped']:.0f}" + (' -> new best' if evaluator.best is not None
+                                                         and evaluator.best['env_steps'] == env_steps else ''), flush=True)
             if it == args.iters:
                 history.append(entry)
                 break
@@ -373,12 +467,14 @@ def main():
             if args.form == 'per_unit':
                 params = fit_per_unit([d for d, _ in results], ci_scale, args.val_episodes, fit_log)
                 entry['fits'] = fit_log
+                log_fits(rl, fit_log, env_steps)
                 history.append(entry)
-                path = os.path.join(args.out_dir, f'value_iter{it + 1}.npz')
-                np.savez(path, **params)
+                path = os.path.join(out_dir, f'value_iter{it + 1}.npz')
+                np.savez(path, **params, **value_meta(scenario, results))
                 value = path
-                with open(os.path.join(args.out_dir, 'history.json'), 'w') as f:
+                with open(os.path.join(out_dir, 'history.json'), 'w') as f:
                     json.dump(history, f, indent=2)
+                rl.flush()
                 continue
             keys = ('queue', 'soc', 'ctx', 'd_ls', 'd_bat')
             data = {k: np.concatenate([d[k] for d, _ in results]) for k in keys}
@@ -397,28 +493,60 @@ def main():
                 del sdc
             params = fit_values(data, ends, value, args.nstep, args.fits, ci_scale, args.val_episodes, fit_log)
             entry['fits'] = fit_log
+            log_fits(rl, [f for f in fit_log if f['fit'] == args.fits - 1], env_steps)  # the last fit of each head
             history.append(entry)
-            path = os.path.join(args.out_dir, f'value_iter{it + 1}.npz')
-            np.savez(path, **params)
+            path = os.path.join(out_dir, f'value_iter{it + 1}.npz')
+            np.savez(path, **params, **value_meta(scenario, results))
             value = path
-            with open(os.path.join(args.out_dir, 'history.json'), 'w') as f:
+            with open(os.path.join(out_dir, 'history.json'), 'w') as f:
                 json.dump(history, f, indent=2)
+            rl.flush()
 
-    # The value used by the best iteration (by mean change on its own training episodes, all collected with the same
-    # exploration) becomes value.npz. Evaluation episodes (eval_compare.py) are never used for this choice.
-    best = min(history, key=lambda e: e['change_pct_mean'])
-    with open(os.path.join(args.out_dir, 'history.json'), 'w') as f:
+    with open(os.path.join(out_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
-    print('\nIteration summary (work-adjusted CO2 vs noop on training episodes):')
+    print('\nIteration summary (work-adjusted CO2 vs noop; training episodes | fixed-seed evaluation):')
     for e in history:
+        ev = e.get('eval')
         print(f"  iter {e['iteration']} value={os.path.basename(str(e['value']))} explore={e['explore']}: "
-              f"{e['change_pct_mean']:+.2f}% ± {e['change_pct_ci95']:.2f}")
-    if best['value'] != 'naive':
-        import shutil
-        shutil.copy(best['value'], os.path.join(args.out_dir, 'value.npz'))
-        print(f"Saved {args.out_dir}/value.npz (from {os.path.basename(best['value'])}, iteration {best['iteration']})")
+              f"{e['change_pct_mean']:+.2f}% ± {e['change_pct_ci95']:.2f}"
+              + (f" | {ev['co2_work_adjusted_pct_vs_noop']:+.2f}%" if ev else ''))
+    if evaluator is None:
+        # No evaluation episodes: the best iteration on its own training episodes (all collected with exploration).
+        best = min(history, key=lambda e: e['change_pct_mean'])
+        save_value(out_dir, best['value'])
+    rl.close(evaluator.best if evaluator is not None else None)
+    if os.path.exists(os.path.join(out_dir, 'value.npz')):
+        print(f'Saved {out_dir}/value.npz')
     else:
-        print('The naive value was best; no learned value saved as value.npz.')
+        print('The naive value was best (or no evaluation passed the drop guard); no value.npz saved.')
+
+
+def value_meta(scenario, results):
+    """Saved with each value: pv_ctx (its context has the PV features, mpc_value.LearnedValue) and the training
+    scenario (eval_compare.py warns when a policy is evaluated on a different one)."""
+    import mpc_value as M
+    from sdc_eval.constants import SCENARIO_KEYS
+    pv_ctx = int(results[0][0]['ctx'].shape[1] > M.N_BASE_CTX)
+    trained = {k: scenario.get(k) for k in SCENARIO_KEYS if k in scenario}
+    return {'pv_ctx': np.array(pv_ctx), 'scenario': np.array(json.dumps(trained))}
+
+
+def save_value(out_dir, value):
+    """value.npz = the given iteration's value; the naive value has no file, so value.npz is removed."""
+    import shutil
+    target = os.path.join(out_dir, 'value.npz')
+    if value == 'naive':
+        if os.path.exists(target):
+            os.remove(target)
+    else:
+        shutil.copy(value, target)
+
+
+def log_fits(rl, fit_log, env_steps):
+    """health/value_fit_<head>/*: diagnostics of the value fit made from this iteration's data."""
+    for f in fit_log:
+        rl.scalars(f"health/value_fit_{f['head']}",
+                   {k: v for k, v in f.items() if k not in ('head', 'fit')}, env_steps)
 
 
 if __name__ == '__main__':

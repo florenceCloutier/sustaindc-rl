@@ -20,6 +20,8 @@ from utils.managers import (CI_Manager, PV_Manager, Time_Manager, Weather_Manage
 from utils.utils_cf import get_energy_variables, get_init_day, is_dated_location, obtain_paths
 from utils.joint_obs import PV_OBS_DIM as N_PV_OBS
 from utils.joint_obs import BAT_WORKLOAD_IDX, DC_NEXT_WORKLOAD_IDX, DC_WORKLOAD_IDX, LS_WORKLOAD_IDX
+from sdc_eval.constants import NOOP
+from sdc_eval.metrics import EpisodeAccumulator
 
 import matplotlib
 matplotlib.use('Agg')  # Use a non-interactive backend suitable for servers without display
@@ -73,10 +75,11 @@ class EnvConfig(dict):
         # flexible load ratio of the total workload
         'flexible_load': 0.1,
         
-        # Specify reward methods. These are defined in utils/reward_creator.
-        'ls_reward': 'default_ls_reward',
-        'dc_reward': 'default_dc_reward',
-        'bat_reward': 'default_bat_reward',
+        # Specify reward methods. These are defined in utils/reward_creator. co2_team_reward: the step's grid CO2 plus
+        # 2x the CO2 of dropped work, the same for every agent (default_*_reward: the original SustainDC rewards).
+        'ls_reward': 'co2_team_reward',
+        'dc_reward': 'co2_team_reward',
+        'bat_reward': 'co2_team_reward',
 
         # Evaluation flag that is required by the load-shifting environment
         # To be set only during offline evaluation
@@ -103,6 +106,22 @@ class EnvConfig(dict):
         # limit). What is left is curtailed (False) or exported and credited at the current carbon intensity (True;
         # net CO2 can then be negative).
         'pv_export_credit': False,
+
+        # Master switch for on-site PV in the run.
+        #   None (default): previous behaviour. PV is on iff pv_config.capacity_kWp > 0 and is dispatched by the
+        #                   automatic self-consumption rule above (pv_export_credit applies).
+        #   False:          no PV in the run, whatever pv_config says.
+        #   True:           PV is on (pv_config.capacity_kWp must be > 0) and the battery agent decides what to do
+        #                   with it every step: 'use' (supply the DC), 'battery' (charge the battery) or 'resell'
+        #                   (sell to the grid, credited against CO2 at the current CI). The battery agent's action
+        #                   space becomes Discrete(9): action = battery_action + 3 * pv_action (see
+        #                   envs/bat_env_fwd_view.py). pv_export_credit is ignored.
+        'include_pv': None,
+
+        # include_pv=True only: CO2 credit per kWh of resold PV, as a fraction of the current carbon intensity
+        # (1.0 = resold renewable energy displaces the same amount of grid energy; then every PV action is worth
+        # the same except to avoid curtailment, so the default is 0.5: export pays less than self-consumption).
+        'pv_resell_credit': 0.5,
     }
 
     def __init__(self, raw_config):
@@ -164,13 +183,13 @@ class SustainDC(gym.Env):
 
         ci_loc, wea_loc = obtain_paths(self.location)
         
-        ls_reward_method = 'default_ls_reward' if not 'ls_reward' in env_config.keys() else env_config['ls_reward']
+        ls_reward_method = env_config.get('ls_reward', 'co2_team_reward')
         self.ls_reward_method = reward_creator.get_reward_method(ls_reward_method)
 
-        dc_reward_method =  'default_dc_reward' if not 'dc_reward' in env_config.keys() else env_config['dc_reward']
+        dc_reward_method = env_config.get('dc_reward', 'co2_team_reward')
         self.dc_reward_method = reward_creator.get_reward_method(dc_reward_method)
         
-        bat_reward_method = 'default_bat_reward' if not 'bat_reward' in env_config.keys() else env_config['bat_reward']
+        bat_reward_method = env_config.get('bat_reward', 'co2_team_reward')
         self.bat_reward_method = reward_creator.get_reward_method(bat_reward_method)
         
         n_vars_energy, n_vars_battery = 0, 0  # For partial observability (for p.o.)
@@ -190,7 +209,23 @@ class SustainDC(gym.Env):
         self.bat_env.dcload_max = self.dc_env.power_ub_kW / 4  # Assuming 15 minutes timestep. Kwh
         
         self.bat_env.dcload_min = self.dc_env.power_lb_kW / 4  # Assuming 15 minutes timestep. Kwh
-        
+
+        # PV switch (see EnvConfig): 'auto' (legacy self-consumption rule), 'off' or 'agent' (PV dispatch actions).
+        pv_config = dict(env_config['pv_config'] or {})
+        include_pv = env_config['include_pv']
+        if include_pv is None:
+            self.pv_mode = 'auto'
+        elif include_pv:
+            if not pv_config.get('capacity_kWp', 0) > 0:
+                raise ValueError("include_pv=True needs an on-site PV array: set pv_config.capacity_kWp > 0 "
+                                 f"(got {pv_config.get('capacity_kWp', 0)!r}).")
+            self.pv_mode = 'agent'
+        else:
+            self.pv_mode = 'off'
+            pv_config['capacity_kWp'] = 0
+        self.include_pv = self.pv_mode == 'agent'
+        self.bat_env.set_pv_dispatch(self.include_pv, resell_credit=env_config['pv_resell_credit'])
+
         self._obs_space_in_preferred_format = True
         
         self.observation_space = []
@@ -251,8 +286,8 @@ class SustainDC(gym.Env):
         self.ci_m = CI_Manager(init_day=self.init_day, location=ci_loc, filename=self.ci_file, future_steps=n_vars_ci, timezone_shift=self.timezone_shift,
                                utc_offset_hours=utc_offset)
         # On-site PV from the same EPW file as the weather manager (and kept in sync with its random day roll).
-        self.pv_m = PV_Manager(wea_loc, pv_config=env_config['pv_config'], init_day=self.init_day, timezone_shift=self.timezone_shift)
-        self.bat_env.pv_export_credit = bool(env_config['pv_export_credit'])
+        self.pv_m = PV_Manager(wea_loc, pv_config=pv_config, init_day=self.init_day, timezone_shift=self.timezone_shift)
+        self.bat_env.pv_export_credit = bool(env_config['pv_export_credit']) and self.pv_mode == 'auto'
 
         # This actions_are_logits is True only for MADDPG if continuous actions is used on the algorithm.
         self.actions_are_logits = env_config.get("actions_are_logits", False)
@@ -555,6 +590,9 @@ class SustainDC(gym.Env):
         self.ls_terminated = self.dc_terminated = self.bat_terminated = False
         self.ls_truncated = self.dc_truncated = self.bat_truncated = False
         self.ls_reward = self.dc_reward = self.bat_reward = 0
+        # Physical metrics of the episode (sdc_eval.metrics), attached to the info of the last step as
+        # info[agent]['episode_metrics'] so every wrapper/trainer logs the same per-episode metrics.
+        self.episode_acc = EpisodeAccumulator(record_inputs=False)
 
         # Reset the managers
         if init_day is None or init_hour is None:
@@ -701,6 +739,7 @@ class SustainDC(gym.Env):
 
         # Calculate rewards for all agents based on the updated state
         reward_params = self._calculate_reward_params(workload, temp, ci_i, ci_i_future, day, hour, terminal)
+        reward_params['dc_task_kwh'] = self.task_kwh(self.ls_info['ls_shifted_workload'], temp)
         self.ls_reward, self.dc_reward, self.bat_reward = self.calculate_reward(reward_params)
 
         # Update rewards, terminations, and truncations for each agent
@@ -730,12 +769,39 @@ class SustainDC(gym.Env):
         }
 
 
+        self.episode_acc.step(info['agent_ls'], {**NOOP, **action_dict}, (  # inactive agents do nothing
+            self.ls_reward, self.dc_reward, self.bat_reward))
+
         # Handle termination if the episode ends
         if terminal:
             self._handle_terminal(terminateds, truncateds)
+            episode_metrics = self.episode_acc.finalize(self)
+            for agent in ('agent_ls', 'agent_dc', 'agent_bat'):
+                info[agent]['episode_metrics'] = episode_metrics
 
         return obs, rew, terminateds, truncateds, info
 
+
+    TASK_KWH_GRID = np.linspace(0.0, 1.0, 21)  # utilization grid of the cached power curves
+
+    def task_kwh(self, utilization, ambient):
+        """Marginal energy (kWh) of one task now: sdc_eval.metrics.task_marginal_kwh (slope of IT + HVAC power over
+        utilization +- 0.05, 18 C setpoint), computed from a cached power curve.
+
+        The DC model is too slow to evaluate every step, so per weather condition (ambient and wet bulb rounded to
+        0.5 C) the power is tabulated on a 0.05 utilization grid and the slope is read off it by linear
+        interpolation. Matches task_marginal_kwh closely (tests/verify_common_eval.py).
+        """
+        from baseline_policies import dc_power
+        key = (round(float(ambient) * 2) / 2, round(float(self.dc_env.wet_bulb) * 2) / 2)
+        cache = self.__dict__.setdefault('_task_kwh_cache', {})
+        curve = cache.get(key)
+        if curve is None:
+            curve = cache[key] = np.array([sum(dc_power(self, u, 18.0, key[0], key[1])) for u in self.TASK_KWH_GRID])
+        u = min(max(float(utilization), 0.0), 1.0)
+        lo, hi = max(u - 0.05, 0.0), min(u + 0.05, 1.0)
+        slope_w = (np.interp(hi, self.TASK_KWH_GRID, curve) - np.interp(lo, self.TASK_KWH_GRID, curve)) / (hi - lo)
+        return float(slope_w / 1e3 * 0.25 * 0.01)  # W per unit utilization -> kWh per task (1 % for 15 minutes)
 
     def _validate_actions(self, action_dict):
         """Check that every active agent has a valid discrete action and return them as plain ints.

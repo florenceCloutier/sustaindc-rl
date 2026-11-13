@@ -15,9 +15,12 @@ battery_config:
   taper_start: 0.90    # charging power tapers linearly to 0 between taper_start and soc_max
 individual_reward_weight: 0.8
 flexible_load: 0.6
-ls_reward: default_ls_reward
-dc_reward: default_dc_reward
-bat_reward: default_bat_reward
+# Reward: the grid CO2 of each step plus 2x the CO2 of dropped work, the same for all three agents
+# (utils/reward_creator.co2_team_reward). The original SustainDC rewards (z-scored energy x normalized CI against a
+# running history) remain available as default_ls_reward / default_dc_reward / default_bat_reward.
+ls_reward: co2_team_reward
+dc_reward: co2_team_reward
+bat_reward: co2_team_reward
 dc_config_file: 'dc_config.json'
 month: 6
 days_per_episode: 30
@@ -44,3 +47,10 @@ include_pv_obs: False
 # PV goes to the DC load first, then automatically to the battery; the rest is curtailed (False) or exported and
 # credited at the grid CI (True).
 pv_export_credit: False
+# PV switch. null: as above (PV on iff capacity_kWp > 0, automatic rule). False: no PV. True: PV on (needs
+# capacity_kWp > 0) and the battery agent picks a PV action every step: use (supply the DC), battery (charge the
+# battery) or resell (sell to the grid, credited against CO2 at the current CI). Its action space becomes Discrete(9).
+include_pv: null
+# include_pv True only: CO2 credit of resold PV, as a fraction of the current CI. Below 1 so that using PV on
+# site or storing it beats reselling it (at 1.0 every PV action is worth the same except to avoid curtailment).
+pv_resell_credit: 0.5
