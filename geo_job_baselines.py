@@ -217,27 +217,37 @@ class JobRouter:
         self.kind = kind
 
     def reset(self, geo):
+        self.decision_seconds = []
         if self.kind != 'origin':
             self.n = geo.horizon + 2
             self.ci, _, self.A = marginal_table(geo, self.n)
 
     def route(self, geo):
+        import time
+        t0 = time.time()
+        out = self._route(geo)
+        self.decision_seconds.append(time.time() - t0)
+        return out
+
+    def _route(self, geo):
         arr = geo.arrivals()
         out = np.full(len(arr), -1, dtype=np.int64)
         if self.kind == 'origin' or len(arr) == 0:
             return out
         proj = geo.committed_load()
+        queues = geo.site_groups()['queue']
         for i in range(geo.n_sites):
-            proj[i] += geo.size[geo.queue(i), i].sum()
+            proj[i] += geo.size[queues[i], i].sum()
         score = (self.ci if self.kind == 'greedy_ci' else self.A)[:, geo.t]
         order = np.argsort(score)
+        inv_cap = 1.0 / geo.cap_w[order]
         for k in np.argsort(geo.latest_start[arr], kind='stable'):
             j = arr[k]
             if geo.rigid[j]:
                 i = geo.origin[j]
             else:
-                fits = [i for i in order if proj[i] + geo.size[j, i] <= geo.cap + 1e-12]
-                i = fits[0] if fits else int(np.argmin(proj))
+                fits = proj[order] + geo.power_w[j] * inv_cap <= geo.cap + 1e-12     # sites in score order
+                i = int(order[np.argmax(fits)]) if fits.any() else int(np.argmin(proj))
             out[k] = i
             proj[i] += geo.size[j, i]
         return out

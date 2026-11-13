@@ -73,6 +73,28 @@ ROUTING_MODES = ('pool', 'site_queue')
 _TRACE = {}
 
 
+class JobSizes:
+    """size[j, i] = power_w[j] / cap_w[i] (fraction of site i's IT capacity) without the (jobs x sites) matrix, which
+    does not fit in memory at hundreds of sites. Indexing as numpy's: size[j, i], size[jobs, i], size[:, i],
+    size[jobs, sites] (paired), size[jobs] or size[j] (rows over every site)."""
+
+    def __init__(self, power_w, cap_w):
+        self.power_w, self.cap_w = power_w, cap_w
+        self.shape = (len(power_w), len(cap_w))
+
+    def __getitem__(self, key):
+        r, c = key if isinstance(key, tuple) else (key, slice(None))
+        p, k = self.power_w[r], self.cap_w[c]
+        if isinstance(c, slice):                 # rows x every (selected) site
+            return np.multiply.outer(p, 1.0 / k)
+        if isinstance(r, slice):
+            return np.multiply.outer(p, 1.0 / k) if np.ndim(k) else p / k
+        return p / k                             # scalar, (jobs, one site) or paired arrays
+
+    def __array__(self, dtype=None):
+        return self[:, :] if dtype is None else self[:, :].astype(dtype)
+
+
 def load_trace(path=JOBS_FILE):
     if path not in _TRACE:
         if not os.path.exists(path):
@@ -161,11 +183,16 @@ class GeoJobsDC(GeoSustainDC):
         self.rigid = rng.random(self.n_jobs) < cfg['rigid_fraction']
         # origin: population weight x business-hours activity in each site's local standard time
         utc_hour = ((self.utc0 + self.arrival) // 4) % 24
-        local_hour = (utc_hour[:, None] + self.utc_offsets[None, :].astype(int)) % 24
+        local_hour = (np.arange(24)[:, None] + self.utc_offsets[None, :].astype(int)) % 24      # per UTC hour
         w = self.population_weight[None, :] * np.where((local_hour >= 8) & (local_hour < 20), 1.0, 0.3)
         cdf = np.cumsum(w / w.sum(1, keepdims=True), axis=1)
-        self.origin = np.minimum((rng.random(self.n_jobs)[:, None] > cdf).sum(1), self.n_sites - 1)
-        self.size = self.power_w[:, None] / self.cap_w[None, :]  # (jobs, sites): fraction of each site's capacity
+        u = rng.random(self.n_jobs)
+        self.origin = np.zeros(self.n_jobs, dtype=np.int64)
+        for h in range(24):                      # number of cdf entries below u, per UTC hour
+            sel = utc_hour == h
+            self.origin[sel] = np.searchsorted(cdf[h], u[sel], side='left')
+        self.origin = np.minimum(self.origin, self.n_sites - 1)
+        self.size = JobSizes(self.power_w, self.cap_w)  # size[j, i]: fraction of site i's capacity
         self._arr_ptr = 0
 
     def _arrive(self):
@@ -295,8 +322,9 @@ class GeoJobsDC(GeoSustainDC):
         order; jobs that do not fit stay queued), or None for earliest-deadline-first. Then force-start due jobs at
         their own site when they fit."""
         load = self.committed_load()
+        queues = self.site_groups()['queue']      # starting at site i leaves the other queues unchanged
         for i in range(self.n_sites):
-            q = self.queue(i)
+            q = queues[i]
             todo = q if starts is None or starts[i] is None else [j for j in starts[i] if self.status[j] == 1 and self.site[j] == i]
             for j in todo:
                 self._try_start(int(j), i, load)

@@ -219,8 +219,12 @@ class SiteLP:
 
     def solve(self, phi=0.0, ci=None):
         """Optimal value (g, with penalties) and solution when a share phi of the bundle(s) must be placed."""
-        res = linprog(self.objective(ci), A_ub=self.A_ub, b_ub=self.b_ub, A_eq=self.A_eq, b_eq=self.rhs(phi),
-                      bounds=self.bounds, method='highs')
+        args = dict(A_ub=self.A_ub, b_ub=self.b_ub, A_eq=self.A_eq, b_eq=self.rhs(phi), bounds=self.bounds)
+        c = self.objective(ci)
+        for method in ('highs', 'highs-ds', 'highs-ipm'):   # always feasible (overflow); failures are numerical
+            res = linprog(c, method=method, **args)
+            if res.status == 0:
+                break
         if res.status != 0:
             return np.inf, None
         return float(res.fun), res.x
@@ -239,11 +243,29 @@ class IndexPolicy:
         cooling        'envelope' (best setpoint, executed by moving the setpoint) or 'fixed' (current setpoint)
         execute_local  True: battery and setpoint follow the site plan; False: they are left to the caller
         plan_every     re-solve each site's plan every this many steps (cost curves are always hourly)
+        cap_margin     plan to cap - cap_margin (fluid plans fill capacity exactly; whole jobs then overflow it)
+        reserve_steps  start a planned job early only if the queued jobs due within this many steps still fit at
+                       their latest start (0: off, as before)
+        admission      'plan': a job may go to a site where it fits at some start before its latest start, given the
+                       site's plan; 'latest': only where it fits at its latest start with every job already queued
+                       there also placed at its latest start (a feasible schedule always exists; use with
+                       reserve_steps so that early starts keep it feasible)
+        bat_threshold  charge / discharge (at full power, the simulator's battery actions) when this step's planned
+                       charge / discharge is at least this share of the battery's power. Plans spread discharges
+                       thinly over many steps; with a high threshold they are dropped and the battery only charges.
     """
 
     def __init__(self, window_h=24, slack_edges=(4, 8), levels=4, cooling='envelope', execute_local=True,
-                 plan_every=1):
+                 plan_every=1, cap_margin=0.0, reserve_steps=0, execute_battery=True, bat_threshold=0.1,
+                 admission='plan'):
         self.plan_every = int(plan_every)
+        self.cap_margin = float(cap_margin)
+        self.reserve_steps = int(reserve_steps)
+        self.execute_battery = bool(execute_battery)
+        self.bat_threshold = float(bat_threshold)
+        if admission not in ('plan', 'latest'):
+            raise ValueError("admission must be 'plan' or 'latest'")
+        self.admission = admission
         self.H = int(window_h * 4)
         self.edges = np.asarray(slack_edges, dtype=float)
         self.G = int(levels)
@@ -273,7 +295,8 @@ class IndexPolicy:
         return np.searchsorted(self.edges, slack, side='right')
 
     def _site_lp(self, geo, i, bundle=None):
-        return SiteLP(geo, i, geo.t, self.H, self.ci[i], (self.lines[0][i], self.lines[1][i]), geo.cap, bundle=bundle)
+        return SiteLP(geo, i, geo.t, self.H, self.ci[i], (self.lines[0][i], self.lines[1][i]), geo.cap - self.cap_margin,
+                      bundle=bundle)
 
     def _ci_for(self, geo, i, lp):
         """CI over lp's window that site i plans with (None: the true CI; ScreenedIndexPolicy uses forecasts)."""
@@ -318,11 +341,15 @@ class IndexPolicy:
             v, x = self._solve(lp, ph, ci)
             vals.append(v)
             xs.append(x)
-        nus = np.diff(vals) / (np.diff(phis) * work)
-        if np.any(np.diff(nus) < -1e-6 * max(1.0, np.nanmax(np.abs(nus)))):
+        vals = np.array(vals, dtype=float)
+        with np.errstate(invalid='ignore'):
+            nus = np.diff(vals) / (np.diff(phis) * work)
+        nus[~(np.isfinite(vals[1:]) & np.isfinite(vals[:-1]))] = np.inf     # a failed solve: unknown, never cheap
+        fin = nus[np.isfinite(nus)]
+        if len(fin) > 1 and np.any(np.diff(fin) < -1e-6 * max(1.0, np.abs(fin).max())):
             self.stats['curve_violations'] += 1
             nus = np.maximum.accumulate(nus)
-        return nus, np.array(vals), xs
+        return nus, vals, xs
 
     def _replan(self, geo):
         """Hourly: each site's plan (phi = 0) and its cost curve per bundle."""
@@ -355,7 +382,7 @@ class IndexPolicy:
         # planned occupancy (full steps, as the env checks capacity): committed + planned starts' occupancy
         occ = lp.R_occ.copy()
         for k, (c, s) in enumerate(zip(lp.xc, lp.xs)):
-            if x[k] > 1e-9:
+            if x[k] > 1e-9 and lp.classes[c]['kind'] == 'queue':   # bundles are forecasts, not reservations
                 o = lp.classes[c]['occ'][:lp.W - s]
                 occ[s:s + len(o)] += x[k] * o
         return {'t0': t, 'classes': [cl['jobs'] for cl in lp.classes if cl['kind'] == 'queue'], 'starts': starts,
@@ -397,6 +424,9 @@ class IndexPolicy:
         slack = geo.latest_start[arr] - geo.arrival[arr]
         n = int(np.ceil(slack.max() + geo.dur[arr].max())) + 2
         load = np.stack([self._planned_load(geo, i, n) for i in range(geo.n_sites)])  # (N, n), updated as we route
+        latest = self.admission == 'latest'
+        if latest:
+            lat = np.stack([self._latest_profile(geo, i, n) for i in range(geo.n_sites)])
         for k in np.argsort(geo.latest_start[arr], kind='stable'):
             j = arr[k]
             last = int(max(np.floor(geo.latest_start[j] - geo.t + 1e-9), 0))
@@ -404,6 +434,10 @@ class IndexPolicy:
             sites = [int(geo.origin[j])] if geo.rigid[j] else range(geo.n_sites)
             slot = {}
             for i in sites:
+                if latest:
+                    if lat[i, last:last + span].max(initial=0.0) + geo.size[j, i] <= geo.cap + 1e-12:
+                        slot[i] = last
+                    continue
                 win = np.lib.stride_tricks.sliding_window_view(load[i], span)[:last + 1].max(axis=1)
                 ok = np.flatnonzero(win + geo.size[j, i] <= geo.cap + 1e-12)
                 if len(ok):
@@ -419,14 +453,35 @@ class IndexPolicy:
                 score = np.where([i in slot for i in range(geo.n_sites)], score, np.inf)
                 if np.isfinite(score).any():
                     i = int(np.argmin(score))
+                elif latest:  # admitted nowhere: the site whose latest-start schedule overflows least
+                    self.stats['admission_fallbacks'] = self.stats.get('admission_fallbacks', 0) + 1
+                    i = int(np.argmin(lat[:, last:last + span].max(axis=1, initial=0.0)
+                                      + geo.size[j, np.arange(geo.n_sites)]))
                 else:  # fits nowhere in time: the site with the most room soonest
                     i = int(np.argmin(load[:, :last + 1].min(axis=1)))
                 if self.curves.get((i, b)) is not None:
                     self.acc[i, b] += w
             s0 = slot.get(i, 0)
             load[i, s0:s0 + span] += geo.size[j, i]
+            if latest:
+                lat[i, last:last + span] += geo.size[j, i]
             out[k] = i
         return out
+
+    @staticmethod
+    def _latest_profile(geo, i, n):
+        """Site i's occupancy over the next n steps if every job queued there starts at its latest start (and the
+        running jobs run on): the admission test of admission='latest'."""
+        tau = geo.t + np.arange(n)
+        run = geo.running(i)
+        prof = (geo.size[run, i][:, None] * (tau[None, :] < np.ceil(geo.end_step[run, None] - 1e-9))).sum(0)
+        q = geo.queue(i)
+        if len(q):
+            s0 = np.maximum(np.floor(geo.latest_start[q] + 1e-9).astype(int) - geo.t, 0)
+            d = np.ceil(geo.dur[q] - 1e-9).astype(int)
+            o = np.arange(n)[None, :]
+            prof += (geo.size[q, i][:, None] * ((o >= s0[:, None]) & (o < (s0 + d)[:, None]))).sum(0)
+        return prof
 
     def starts(self, geo):
         """Per site: queued jobs the plan starts in this step (per class, earliest deadline first)."""
@@ -459,8 +514,45 @@ class IndexPolicy:
             q = geo.queue(i)
             due = q[geo.latest_start[q] < geo.t + 1]
             todo = np.unique(np.r_[np.asarray(todo, dtype=np.int64), due])
-            out.append(todo[np.argsort(geo.latest_start[todo], kind='stable')].tolist())
+            todo = todo[np.argsort(geo.latest_start[todo], kind='stable')]
+            if self.reserve_steps:
+                todo = self._reserve(geo, i, q, todo)
+            out.append(todo.tolist())
         return out
+
+    def _reserve(self, geo, i, q, todo):
+        """Drop planned (not yet due) starts that would leave no room for the queued jobs due within reserve_steps,
+        each placed at its latest start. Fluid plans round to whole jobs; without this, a site near capacity starts
+        a non-urgent job and a job due the next step cannot start (an SLA violation)."""
+        t, R = geo.t, self.reserve_steps
+        L = R + int(np.ceil(geo.trace['max_dur_steps'])) + 1
+        tau = t + np.arange(L)
+        run = geo.running(i)
+        prof = (geo.size[run, i][:, None] * (tau[None, :] < np.ceil(geo.end_step[run, None] - 1e-9))).sum(0)
+        last = np.floor(geo.latest_start[q] + 1e-9).astype(int) - t          # relative latest start slot
+        soon = q[(last >= 1) & (last <= R)]
+        slot = {}
+        for j in soon:                                                     # reservations at the latest start
+            s0, d = int(np.floor(geo.latest_start[j] + 1e-9)) - t, int(np.ceil(geo.dur[j] - 1e-9))
+            prof[s0:s0 + d] += geo.size[j, i]
+            slot[int(j)] = (s0, d)
+        keep = []
+        for j in todo:
+            j = int(j)
+            d = int(np.ceil(geo.dur[j] - 1e-9))
+            if geo.latest_start[j] < t + 1:                                # due now: always tried
+                keep.append(j)
+                continue
+            trial = prof.copy()
+            if j in slot:
+                s0, dj = slot[j]
+                trial[s0:s0 + dj] -= geo.size[j, i]
+            trial[:d] += geo.size[j, i]
+            over = lambda p: float(np.maximum(p - geo.cap, 0.0).sum())
+            if over(trial) <= over(prof) + 1e-12:                         # no new overflow (moving a crowded job up helps)
+                prof = trial
+                keep.append(j)
+        return np.array(keep, dtype=np.int64)
 
     def site_actions(self, geo):
         acts = []
@@ -469,10 +561,10 @@ class IndexPolicy:
             plan = self.plans[i]
             if self.execute_local and plan is not None:
                 k = geo.t - plan['t0']
-                if k < len(plan['ch']):
-                    if plan['ch'][k] >= 0.5 * plan['p_kwh']:
+                if k < len(plan['ch']) and self.execute_battery:
+                    if plan['ch'][k] >= self.bat_threshold * plan['p_kwh'] and plan['ch'][k] >= plan['dis'][k]:
                         a['agent_bat'] = 0
-                    elif plan['dis'][k] >= 0.5 * plan['p_kwh']:
+                    elif plan['dis'][k] >= self.bat_threshold * plan['p_kwh']:
                         a['agent_bat'] = 1
                     if self.best_stpt is not None:
                         u = plan['u'][k]
