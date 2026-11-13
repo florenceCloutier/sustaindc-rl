@@ -23,6 +23,17 @@ uses no capacity and is charged a lower bound on its CO2: its load-steps x the l
 load over all of its allowed sites and steps (the energy curve is convex, so the marginal energy at any load is at
 least the one at zero load). The result stays a valid lower bound; `overflow_job_mwh` reports how much work used it.
 
+Site flexibility (`site_flex`): the simulated hardness runs hold cooling and battery fixed, and so does the default
+bound ('none': the current CRAC setpoint for the whole episode, no battery). With 'battery' and/or 'cooling'
+(e.g. 'battery+cooling'), the bound also lets every site
+    battery  charge and discharge continuously within its power limit and usable SoC window, with its efficiencies:
+             g = z + ch - dis (grid energy), soc' = soc + eff_c ch - dis / eff_d, dis <= z (no export). The simulator's
+             battery (three discrete actions, charging taper above 90% SoC) is a subset of this.
+    cooling  pick the best CRAC setpoint every step: the energy curve is replaced by lines below min over
+             SETPOINT_GRID (+ the current setpoint) of dc_power (envelope_lines; the +-1 C per step limit is ignored).
+             About 9x the cost of energy_curves to build.
+Both only enlarge the feasible set, so the result is still a valid lower bound for policies that use them.
+
 Solver: HiGHS interior point by default; if it stops with an error (not infeasibility), the solve is retried with the
 dual simplex.
 
@@ -39,11 +50,12 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.optimize import linprog
 
-from baseline_policies import dc_power
+from baseline_policies import SETPOINT_GRID, dc_power
 from geo_sustaindc_env import STEP_HOURS
 
 VARIANTS = ('local', 'geo', 'time', 'geo_time')
 TANGENT_LOADS = np.linspace(0.0, 1.0, 11)
+SITE_FLEX = ('none', 'battery', 'cooling', 'battery+cooling')
 
 
 def exo_traces(geo, n_steps):
@@ -59,26 +71,83 @@ def exo_traces(geo, n_steps):
     return out
 
 
-def energy_curves(geo, traces):
-    """Per site and step, IT + cooling energy (kWh) on TANGENT_LOADS and its slope: (N, T, K) values and slopes."""
+FINE_LOADS = np.linspace(0.0, 1.0, 101)
+
+
+def sampled_lines(f, x=FINE_LOADS, anchors=TANGENT_LOADS):
+    """Lines z >= a + b u below the samples f(x) (x increasing): at each anchor load, the finite-difference slope of
+    the samples, with the intercept lowered so the line is below every sample. dc_power has small kinks (it is not
+    exactly convex in load), so tangents alone can rise above the curve near a kink; this lowering removes that.
+    Returns (slopes, intercepts), each len(anchors)."""
+    k = np.searchsorted(x, anchors).clip(1, len(x) - 2)
+    b = (f[k + 1] - f[k - 1]) / (x[k + 1] - x[k - 1])
+    a = np.min(f[None, :] - b[:, None] * x[None, :], axis=1)
+    # Safety margin for the curvature between samples (measured excess <= 1e-4 of the energy on a 4x finer grid).
+    return b, a - 5e-4 * float(np.max(f))
+
+
+def _weather_key(amb, wb, step):
+    if step is None:
+        return round(float(amb), 2), round(float(wb), 2)
+    return round(float(amb) / step) * step, round(float(wb) / step) * step
+
+
+def energy_curves(geo, traces, loads=FINE_LOADS, weather_step=None):
+    """Per site and step, lines below the IT + cooling energy curve (kWh per step) at the site's fixed setpoint, as
+    tangent-style (values at TANGENT_LOADS, slopes): (N, T, K) each. Built from FINE_LOADS samples (sampled_lines).
+    `loads` and `weather_step` (round the weather to that many C to share curves) trade accuracy for speed; the
+    defaults are what keeps the bound valid."""
     N, T, K = geo.n_sites, len(traces[0]['ci']), len(TANGENT_LOADS)
     val, slope = np.zeros((N, T, K)), np.zeros((N, T, K))
-    h = 1e-3
     for i, (s, tr) in enumerate(zip(geo.sites, traces)):
         cache = {}
         for t in range(T):
-            key = (round(tr['amb'][t], 2), round(tr['wb'][t], 2))
+            key = _weather_key(tr['amb'][t], tr['wb'][t], weather_step)
             if key not in cache:
-                v, g = [], []
-                for u in TANGENT_LOADS:
-                    lo, hi = max(u - h, 0.0), min(u + h, 1.0)
-                    p = sum(dc_power(s, u, tr['stpt'], *key))
-                    p_lo, p_hi = sum(dc_power(s, lo, tr['stpt'], *key)), sum(dc_power(s, hi, tr['stpt'], *key))
-                    v.append(p / 1e3 * STEP_HOURS)
-                    g.append((p_hi - p_lo) / (hi - lo) / 1e3 * STEP_HOURS)
-                cache[key] = (np.array(v), np.array(g))
+                f = np.array([sum(dc_power(s, u, tr['stpt'], *key)) for u in loads]) / 1e3 * STEP_HOURS
+                b, a = sampled_lines(f, loads)
+                cache[key] = (a + b * TANGENT_LOADS, b)
             val[i, t], slope[i, t] = cache[key]
     return val, slope
+
+
+def tangent_lines(curves):
+    """Tangents of energy_curves() as lines z >= a + b u: (slopes, intercepts), each (N, T, K)."""
+    val, slope = curves
+    return slope, val - slope * TANGENT_LOADS[None, None, :]
+
+
+def envelope_lines(geo, traces, setpoints=SETPOINT_GRID, loads=FINE_LOADS, weather_step=None):
+    """Best-setpoint energy curve per site and step: lines below min over setpoints (+ the site's current setpoint) of
+    IT + cooling energy (kWh per step), sampled on FINE_LOADS (sampled_lines). Including the current setpoint keeps it
+    at or below energy_curves(). Cost: len(setpoints) x len(FINE_LOADS) dc_power calls per distinct weather.
+    Returns (slopes, intercepts) each (N, T, K) and the best setpoint (N, T, K) at each of TANGENT_LOADS."""
+    N, T, K = geo.n_sites, len(traces[0]['ci']), len(TANGENT_LOADS)
+    sl, ic = np.zeros((N, T, K)), np.zeros((N, T, K))
+    best = np.zeros((N, T, K))
+    kx = np.abs(loads[:, None] - TANGENT_LOADS[None, :]).argmin(axis=0)
+    for i, (s, tr) in enumerate(zip(geo.sites, traces)):
+        grid = np.unique(np.r_[np.asarray(setpoints, dtype=float), tr['stpt']])
+        cache = {}
+        for t in range(T):
+            key = _weather_key(tr['amb'][t], tr['wb'][t], weather_step)
+            if key not in cache:
+                e = np.array([[sum(dc_power(s, u, sp, *key)) for u in loads] for sp in grid]) / 1e3 * STEP_HOURS
+                cache[key] = (*sampled_lines(e.min(axis=0), loads), grid[np.argmin(e[:, kx], axis=0)])
+            sl[i, t], ic[i, t], best[i, t] = cache[key]
+    return sl, ic, best
+
+
+def battery_params(geo):
+    """Per site (kWh and kWh per step): capacity, power, efficiencies, usable window and current stored energy."""
+    out = []
+    for s in geo.sites:
+        b = s.bat_env.battery
+        cap = b.capacity * 1e3
+        out.append({'cap_kwh': cap, 'p_kwh': b.power_mw * 1e3 * STEP_HOURS, 'eta_c': b.eff_charge,
+                    'eta_d': b.eff_discharge, 'lo_kwh': b.soc_min * cap, 'hi_kwh': b.soc_max * cap,
+                    'soc0_kwh': b.current_load * 1e3})
+    return out
 
 
 def model_co2_kg(geo, traces, util):
@@ -116,17 +185,24 @@ def job_classes(geo, variant, late_steps):
             'util_prof': util_prof, 'occ_prof': occ_prof, 'late_steps': late_steps}
 
 
-def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None, verbose=True, method='highs-ipm'):
+def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None, verbose=True, method='highs-ipm',
+                site_flex='none', lines=None):
     """Solve the LP for one variant on geo's current episode (call right after geo.reset()). Returns a dict with
     'co2_kg' (the bound), 'late_job_mwh' (work started after its latest start), 'status' and timing."""
     if variant not in VARIANTS:
         raise ValueError(f'variant must be one of {VARIANTS}')
+    if site_flex not in SITE_FLEX:
+        raise ValueError(f'site_flex must be one of {SITE_FLEX}')
+    use_battery, use_cooling = 'battery' in site_flex, 'cooling' in site_flex
     t_start = time.time()
     N, T = geo.n_sites, geo.horizon
     traces = traces or exo_traces(geo, T)
-    if curves is None:
-        curves = energy_curves(geo, traces)
-    val, slope = curves
+    if lines is None:
+        if use_cooling:
+            lines = envelope_lines(geo, traces)[:2]
+        else:
+            lines = tangent_lines(curves if curves is not None else energy_curves(geo, traces))
+    l_slope, l_icpt = lines  # energy z >= l_icpt + l_slope * u, each (N, T, L)
     ci = np.stack([tr['ci'] for tr in traces])  # (N, T)
     cls = job_classes(geo, variant, late_steps)
     span = cls['util_prof'].shape[1]
@@ -154,16 +230,20 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
     iz = nx + N * T + np.arange(N * T)
     iv = nx + 2 * N * T + np.arange(n_cls)  # overflow share of each class
     nvar = nx + 2 * N * T + n_cls
+    if use_battery:  # grid charge, delivered discharge, stored energy at the end of each step (kWh), per (i, t)
+        ich, idis, isoc = (nvar + k * N * T + np.arange(N * T) for k in range(3))
+        nvar += 3 * N * T
+        bat = battery_params(geo)
 
     # objective: CO2 (g) + lateness penalty (g-equivalent)
-    penalty = 10.0 * float((ci[:, :, None] * slope).max())  # per unit-load-step started late
+    penalty = 10.0 * float((ci[:, :, None] * l_slope).max())  # per unit-load-step started late
     c_obj = np.zeros(nvar)
     c_obj[iz] = ci.reshape(-1)
     late_w = cls['occ_prof'][xc, 0] / cap_w[xi]  # size of the class at its site
     c_obj[:nx] = penalty * xlate * late_w
     # Overflow: CO2 lower bound of the class (load-steps x min over allowed sites and steps of CI x zero-load slope),
     # plus a penalty above that of the latest allowed start.
-    floor_cost = ci * slope[:, :, 0]                      # (N, T): g per unit load for one step at zero load
+    floor_cost = ci * l_slope.min(axis=2)                 # (N, T): g per unit load for one step, lowest slope
     floor_any = floor_cost.min(axis=1)                    # (N,)
     load_steps = cls['util_prof'].sum(1)[:, None] / cap_w[None, :]   # (classes, N)
     allowed = np.where(cls['origin'][:, None] < 0, True, np.arange(N)[None, :] == cls['origin'][:, None])
@@ -173,6 +253,9 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
     size = (cls['occ_prof'][:, 0][:, None] / cap_w[None, :]).max(axis=1)
     over_pen = 10 * penalty * ((late_steps + 1) * size + load_steps.max(axis=1))
     c_obj[iv] = co2_floor + over_pen
+    if use_battery:
+        c_obj[ich] = ci.reshape(-1)
+        c_obj[idis] = -ci.reshape(-1)
 
     rows_eq, cols_eq, vals_eq, b_eq = [], [], [], []
     # every class starts once
@@ -197,26 +280,51 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
     cols_eq.append(np.concatenate(c_u))
     vals_eq.append(np.concatenate(v_u))
     b_eq.append(np.zeros(N * T))
+    n_eq = n_cls + N * T
+    if use_battery:
+        # soc[i,t] - soc[i,t-1] - eta_c ch[i,t] + dis[i,t] / eta_d = 0   (soc[i,-1] = current stored energy)
+        eta_c = np.repeat([b['eta_c'] for b in bat], T)
+        eta_d = np.repeat([b['eta_d'] for b in bat], T)
+        r = n_eq + np.arange(N * T)
+        not_first = np.tile(np.arange(T) > 0, N)
+        rows_eq += [r, r, r, r[not_first]]
+        cols_eq += [isoc, ich, idis, isoc[np.flatnonzero(not_first) - 1]]
+        vals_eq += [np.ones(N * T), -eta_c, 1.0 / eta_d, -np.ones(int(not_first.sum()))]
+        soc0 = np.zeros(N * T)
+        soc0[np.arange(N) * T] = [b['soc0_kwh'] for b in bat]
+        b_eq.append(soc0)
+        n_eq += N * T
     A_eq = sp.csr_matrix((np.concatenate(vals_eq), (np.concatenate(rows_eq), np.concatenate(cols_eq))),
-                         shape=(n_cls + N * T, nvar))
+                         shape=(n_eq, nvar))
     b_eq = np.concatenate(b_eq)
 
-    # inequalities: capacity, then tangents  -z + slope*u <= slope*u_k - val
-    K = len(TANGENT_LOADS)
+    # inequalities: capacity, then energy lines  slope*u - z <= -intercept
+    K = l_slope.shape[2]
     A_cap = sp.csr_matrix((np.concatenate(v_o), (np.concatenate(r_o), np.concatenate(c_o))), shape=(N * T, nvar))
     b_cap = np.full(N * T, geo.cap)
     rk = np.arange(N * T * K)
     it = np.repeat(np.arange(N * T), K)
-    sl = slope.reshape(-1)
+    sl = l_slope.reshape(-1)
     A_tan = sp.csr_matrix((np.concatenate([sl, -np.ones(N * T * K)]),
                            (np.concatenate([rk, rk]), np.concatenate([iu[it], iz[it]]))), shape=(N * T * K, nvar))
-    b_tan = (slope * TANGENT_LOADS[None, None, :] - val).reshape(-1)
-    A_ub = sp.vstack([A_cap, A_tan]).tocsr()
-    b_ub = np.concatenate([b_cap, b_tan])
+    b_tan = -l_icpt.reshape(-1)
+    blocks, rhs = [A_cap, A_tan], [b_cap, b_tan]
+    if use_battery:  # no discharging beyond the DC's own energy (no export): dis - z <= 0
+        r = np.arange(N * T)
+        blocks.append(sp.csr_matrix((np.r_[np.ones(N * T), -np.ones(N * T)], (np.r_[r, r], np.r_[idis, iz])),
+                                    shape=(N * T, nvar)))
+        rhs.append(np.zeros(N * T))
+    A_ub = sp.vstack(blocks).tocsr()
+    b_ub = np.concatenate(rhs)
 
     bounds = np.zeros((nvar, 2))
     bounds[:, 1] = np.inf
     bounds[iu, 1] = 1.0
+    if use_battery:
+        bounds[ich, 1] = np.repeat([b['p_kwh'] for b in bat], T)
+        bounds[idis, 1] = np.repeat([b['p_kwh'] for b in bat], T)
+        bounds[isoc, 0] = np.repeat([b['lo_kwh'] for b in bat], T)
+        bounds[isoc, 1] = np.repeat([b['hi_kwh'] for b in bat], T)
     t_build = time.time() - t_start
     res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method=method)
     used = method
@@ -225,15 +333,18 @@ def solve_bound(geo, variant='geo_time', late_steps=4, traces=None, curves=None,
             print(f'[lp {variant}] {method} failed ({res.message}); retrying with highs-ds')
         res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs-ds')
         used = 'highs-ds'
-    out = {'variant': variant, 'status': res.status, 'message': res.message, 'n_vars': nvar, 'n_classes': n_cls,
-           'method': used, 'build_s': t_build, 'solve_s': time.time() - t_start - t_build}
+    out = {'variant': variant, 'site_flex': site_flex, 'status': res.status, 'message': res.message, 'n_vars': nvar,
+           'n_classes': n_cls, 'method': used, 'build_s': t_build, 'solve_s': time.time() - t_start - t_build}
     if res.status != 0:
         if verbose:
             print(f'[lp {variant}] failed: {res.message}')
         out['co2_kg'] = float('nan')
         return out
     x = res.x
-    out['co2_kg'] = float(ci.reshape(-1) @ x[iz] + co2_floor @ x[iv]) / 1e3
+    grid = x[iz] + (x[ich] - x[idis] if use_battery else 0.0)
+    out['co2_kg'] = float(ci.reshape(-1) @ grid + co2_floor @ x[iv]) / 1e3
+    if use_battery:
+        out['battery_discharge_mwh'] = float(x[idis].sum()) / 1e3
     out['overflow_co2_kg'] = float(co2_floor @ x[iv]) / 1e3
     job_mwh = cls['util_prof'].sum(1)[xc] * STEP_HOURS / 1e6  # MWh of the class
     out['late_job_mwh'] = float(np.sum(x[:nx] * job_mwh * (xlate > 0)))
