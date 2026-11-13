@@ -57,6 +57,8 @@ class CarbonLoadEnv(gym.Env):
 
         self.queue_max_len = queue_max_len
         self.tasks_queue = deque(maxlen=self.queue_max_len)
+        # Geo-distributed mode: shiftable tasks routed to this DC for the next step (None = the local share)
+        self.shiftable_override = None
         self.initialize_queue_at_reset = initialize_queue_at_reset
 
     # Calculate task age histogram
@@ -83,6 +85,7 @@ class CarbonLoadEnv(gym.Env):
         """
         self.global_total_steps = 0
         self.tasks_queue.clear()
+        self.shiftable_override = None
         
         if self.initialize_queue_at_reset:
             # Initialize the task queue with tasks of varying ages
@@ -169,6 +172,23 @@ class CarbonLoadEnv(gym.Env):
         return state, info
 
 
+    def task_split(self, workload=None):
+        """(non_shiftable, shiftable) task counts of a workload (default: the current one).
+        One task is 1% of the data center's capacity for one 15-minute step."""
+        w = self.workload if workload is None else workload
+        return (int(math.ceil(w * self.non_shiftable_tasks_percentage * 100)),
+                int(math.floor(w * self.shiftable_tasks_percentage * 100)))
+
+    def planned_tasks(self):
+        """(non_shiftable, shiftable) task counts the next step() will receive: the local split, or the routed
+        shiftable tasks when a geo dispatcher has set `shiftable_override`."""
+        non_shiftable, shiftable = self.task_split()
+        return non_shiftable, shiftable if self.shiftable_override is None else int(self.shiftable_override)
+
+    def planned_workload(self):
+        """Utilization the next step() is asked to run: the local workload plus the net routed-in tasks."""
+        return float(self.workload) + (self.planned_tasks()[1] - self.task_split()[1]) / 100
+
     def step(self, action, workload_rest_day=0):
         """
         Makes an environment step in `CarbonLoadEnv`.
@@ -191,9 +211,21 @@ class CarbonLoadEnv(gym.Env):
 
         # One task is equivalent to 1% of the workload
         # Workload is a float between 0 and 1
-        non_shiftable_tasks = int(math.ceil(self.workload * self.non_shiftable_tasks_percentage * 100))
-        shiftable_tasks     = int(math.floor(self.workload * self.shiftable_tasks_percentage * 100))
+        non_shiftable_tasks, shiftable_tasks = self.task_split()
         tasks_dropped = 0  # Track the number of dropped tasks
+        overflow_tasks = 0
+        shiftable_override, self.shiftable_override = self.shiftable_override, None  # consumed by this step
+        if shiftable_override is not None:
+            # Geo-distributed mode (geo_sustaindc_env.py): the shiftable tasks of this step are the ones the
+            # dispatcher routed here (local non-migratable flexible tasks + migrated ones), not the local share.
+            # More than the DC can run this step (non-shiftable + shiftable > 100%) is forced into the queue
+            # (dropped if the queue is full), whatever the action.
+            shiftable_tasks = int(shiftable_override)
+            overflow_tasks = max(0, non_shiftable_tasks + shiftable_tasks - 100)
+            shiftable_tasks -= overflow_tasks
+            to_queue = min(overflow_tasks, self.queue_max_len - len(self.tasks_queue))
+            tasks_dropped += overflow_tasks - to_queue
+            self.tasks_queue.extend([{'day': self.current_day, 'hour': self.current_hour, 'utilization': 1}] * to_queue)
         actual_tasks_to_process = 0  # Track the number of processed tasks
         # action_value = -1.0 
         # print(f'Action value: {action_value}')
@@ -238,8 +270,8 @@ class CarbonLoadEnv(gym.Env):
             # Vectorized: Add multiple tasks at once
             self.tasks_queue.extend([{'day': self.current_day, 'hour': self.current_hour, 'utilization': 1}] * tasks_to_add)
 
-            # Update utilization
-            self.current_utilization = (overdue_tasks_to_process + (shiftable_tasks - tasks_to_add)) / 100
+            # Update utilization: the deferred tasks that did not fit in the queue are dropped, not run
+            self.current_utilization = overdue_tasks_to_process / 100
         
         elif action == 2:  # Process tasks from the queue
             # available_capacity = 100 - (non_shiftable_tasks + shiftable_tasks)  # Remaining capacity
@@ -305,6 +337,7 @@ class CarbonLoadEnv(gym.Env):
                 'ls_average_task_age': average_task_age/24,
                 'ls_overdue_penalty': overdue_penalty,
                 'ls_computed_tasks': int(self.current_utilization*100),
+                'ls_overflow_tasks': overflow_tasks,
                 'ls_task_age_histogram': task_age_histogram,}
 
 

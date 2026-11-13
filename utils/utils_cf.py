@@ -7,6 +7,26 @@ import os
 file_path = os.path.abspath(__file__)
 PATH = os.path.split(os.path.dirname(file_path))[0]
 
+DCC_DEFAULT_YEAR = 2023
+
+
+def dcc_name(location):
+    """'DCC_<REGION>_<YEAR>' for a DCcluster-Opt location ('dcc:SG', 'dcc:SG:2023' or 'DCC_SG_2023'), else None.
+    The files are made by scripts/import_dccluster_data.py."""
+    loc = str(location)
+    if loc.lower().startswith('dcc:'):
+        parts = loc.split(':')
+        year = int(parts[2]) if len(parts) > 2 else DCC_DEFAULT_YEAR
+        return f'DCC_{parts[1]}_{year}'
+    if loc.startswith('DCC_'):
+        return loc
+    return None
+
+
+def is_dated_location(location):
+    """True for locations whose CI and weather are real, date-aligned series (no random weather day roll)."""
+    return dcc_name(location) is not None
+
 
 def obtain_paths(location):
     """Obtain the correct name for the data files
@@ -20,6 +40,9 @@ def obtain_paths(location):
     Returns:
         List[string]: Naming for the data files
     """
+    dcc = dcc_name(location)
+    if dcc:
+        return [dcc, f'{dcc}.epw']
     if 'az' in location.lower():
         return ['AZ', 'USA_AZ_Phoenix-Sky.Harbor.epw']
     elif 'ca' in location.lower():

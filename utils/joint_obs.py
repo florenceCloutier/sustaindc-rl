@@ -20,7 +20,10 @@ supersuit has zero-padded at the end (as in the HARL wrapper).
 import numpy as np
 
 LS_OBS_DIM = 26
+LS_WORKLOAD_IDX = 13
+DC_WORKLOAD_IDX = 10
 DC_NEXT_WORKLOAD_IDX = 11
+BAT_WORKLOAD_IDX = 10
 DC_NEXT_TEMP_IDX = 13
 DC_SETPOINT_IDX = 14
 BAT_SOC_IDX = 12

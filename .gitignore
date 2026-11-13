@@ -33,3 +33,8 @@ checkpoint_new_model/
 .ipynb_checkpoints/
 # Cluster job scripts (machine/user specific)
 *.sbatch
+
+# DCcluster-Opt data converted by scripts/import_dccluster_data.py (regenerable)
+data/Jobs/
+data/CarbonIntensity/DCC_*
+data/Weather/DCC_*

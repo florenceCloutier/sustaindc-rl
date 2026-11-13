@@ -17,8 +17,9 @@ from utils.make_envs_pyenv import (make_bat_fwd_env, make_dc_pyeplus_env,
                                    make_ls_env)
 from utils.managers import (CI_Manager, PV_Manager, Time_Manager, Weather_Manager,
                             Workload_Manager, epw_utc_offset)
-from utils.utils_cf import get_energy_variables, get_init_day, obtain_paths
+from utils.utils_cf import get_energy_variables, get_init_day, is_dated_location, obtain_paths
 from utils.joint_obs import PV_OBS_DIM as N_PV_OBS
+from utils.joint_obs import BAT_WORKLOAD_IDX, DC_NEXT_WORKLOAD_IDX, DC_WORKLOAD_IDX, LS_WORKLOAD_IDX
 from sdc_eval.constants import NOOP
 from sdc_eval.metrics import EpisodeAccumulator
 
@@ -276,7 +277,10 @@ class SustainDC(gym.Env):
         self.ranges_day = [max(0, self.init_day - 7), min(364, self.init_day + 7)]
         self.t_m = Time_Manager(self.init_day, timezone_shift=self.timezone_shift, days_per_episode=self.days_per_episode)
         self.workload_m = Workload_Manager(init_day=self.init_day, workload_filename=self.workload_file, timezone_shift=self.timezone_shift)
-        self.weather_m = Weather_Manager(init_day=self.init_day, location=wea_loc, filename=self.weather_file, timezone_shift=self.timezone_shift)
+        # Real, dated weather (DCcluster-Opt regions) must not be rolled by random days: it would leave the CI's dates.
+        weather_day_roll = env_config.get('weather_day_roll', not is_dated_location(self.location))
+        self.weather_m = Weather_Manager(init_day=self.init_day, location=wea_loc, filename=self.weather_file, timezone_shift=self.timezone_shift,
+                                         day_roll=weather_day_roll)
         # The CI files are in UTC and the weather files in local standard time: align CI to the weather's clock.
         utc_offset = epw_utc_offset(wea_loc if wea_loc else self.weather_file)
         self.ci_m = CI_Manager(init_day=self.init_day, location=ci_loc, filename=self.ci_file, future_steps=n_vars_ci, timezone_shift=self.timezone_shift,
@@ -536,17 +540,51 @@ class SustainDC(gym.Env):
         return bat_state
 
 
-    def reset(self):
+    def draw_start(self):
+        """Random episode start (day of year, hour), drawn with the `random` module."""
+        day = random.randint(max(0, self.ranges_day[0]), min(364, self.ranges_day[1]))
+        return day, random.randint(0, 23)
+
+    def set_routed_shiftable_tasks(self, n_tasks):
+        """Geo-distributed mode: the shiftable tasks of the next step() are `n_tasks` (set by GeoSustainDC's
+        dispatcher) instead of the local flexible share of the workload. Consumed by the next step().
+
+        The agents' observations are updated in place so that they see the work they will actually be asked to run:
+        their current-workload entries become the planned workload (local + net routed-in tasks), and the cooling
+        agent's next-workload entry is shifted by the same amount (the next routing is not known yet). When the
+        routed tasks equal the local share, the observations are unchanged."""
+        ls = self.ls_env
+        own = float(ls.workload)
+        ls.shiftable_override = int(n_tasks)
+        planned = ls.planned_workload()
+        delta = planned - own
+        self.ls_state[LS_WORKLOAD_IDX] = planned
+        self.dc_state[DC_WORKLOAD_IDX] = planned
+        self.dc_state[DC_NEXT_WORKLOAD_IDX] = min(max(float(self.workload_m.get_next_workload()) + delta, 0.0), 1.5)
+        self.bat_state[BAT_WORKLOAD_IDX] = planned
+
+    def set_external_utilization(self, utilization):
+        """Job mode (geo_jobs.py): the IT utilization of the next step() is `utilization` (0-1, from the jobs running
+        at this site) instead of the load-shifting env's output. Consumed by the next step(); the LS env still steps
+        (with whatever action it gets) for its bookkeeping, but its utilization, queue and drop counts are replaced.
+        The agents' current-workload observation entries are set to it (the next-step entry too: not known yet)."""
+        u = float(min(max(utilization, 0.0), 1.0))
+        self._external_util = u
+        self.ls_state[LS_WORKLOAD_IDX] = u
+        self.dc_state[DC_WORKLOAD_IDX] = u
+        self.dc_state[DC_NEXT_WORKLOAD_IDX] = u
+        self.bat_state[BAT_WORKLOAD_IDX] = u
+
+    def reset(self, init_day=None, init_hour=None):
         """
         Reset the environment.
 
         Args:
-            seed (int, optional): Random seed.
-            options (dict, optional): Environment options.
+            init_day, init_hour (int, optional): episode start (local standard time of the site). Drawn at random
+                (draw_start) when not given; GeoSustainDC passes them to keep its sites on the same clock.
 
         Returns:
             states (dict): Dictionary of states.
-            infos (dict): Dictionary of infos.
         """
         # Reset termination and reward flags for all agents
         self.ls_terminated = self.dc_terminated = self.bat_terminated = False
@@ -557,8 +595,10 @@ class SustainDC(gym.Env):
         self.episode_acc = EpisodeAccumulator(record_inputs=False)
 
         # Reset the managers
-        random_init_day =  random.randint(max(0, self.ranges_day[0]), min(364, self.ranges_day[1])) # self.init_day 
-        random_init_hour = random.randint(0, 23)
+        if init_day is None or init_hour is None:
+            random_init_day, random_init_hour = self.draw_start()
+        else:
+            random_init_day, random_init_hour = int(init_day), int(init_hour)
         self.current_hour = random_init_hour
         
         t_i = self.t_m.reset(init_day=random_init_day, init_hour=random_init_hour)
@@ -804,6 +844,14 @@ class SustainDC(gym.Env):
         # call step method of the load shifting environment with the action and the workload for the rest of the day
         workload_rest_day = self.workload_m.get_n_next_workloads(n=int((24 - self.current_hour) / 0.25))
         self.ls_state, _, self.ls_terminated, self.ls_truncated, self.ls_info = self.ls_env.step(action, workload_rest_day)
+        external_util, self._external_util = getattr(self, '_external_util', None), None
+        if external_util is not None:
+            # Job mode: the utilization comes from the jobs running here (geo_jobs.py), not from the LS env.
+            self.ls_env.tasks_queue.clear()
+            self.ls_info.update({'ls_original_workload': external_util, 'ls_shifted_workload': external_util,
+                                 'ls_tasks_dropped': 0, 'ls_tasks_in_queue': 0, 'ls_norm_tasks_in_queue': 0.0,
+                                 'ls_overdue_penalty': 0, 'ls_oldest_task_age': 0.0, 'ls_average_task_age': 0.0,
+                                 'ls_computed_tasks': int(external_util * 100), 'ls_overflow_tasks': 0})
 
         # Data center agent
         if "agent_dc" in self.agents:
