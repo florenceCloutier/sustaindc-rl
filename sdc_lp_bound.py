@@ -345,6 +345,8 @@ def main():
     p.add_argument('--month', type=int, default=None)
     p.add_argument('--days_per_episode', type=int, default=None)
     p.add_argument('--pv_capacity_kWp', type=float, default=0.0)
+    p.add_argument('--ci_year', type=int, default=None,
+                   help='Year of the carbon intensity data (default: the env yaml, 2022; 2023: held-out, ca and tx).')
     p.add_argument('--n_episodes', type=int, default=10)
     p.add_argument('--seed', type=int, default=FINAL_EVAL_SEED, help='Episode i uses seed + i (as eval_compare.py).')
     p.add_argument('--out_dir', required=True)
@@ -352,7 +354,7 @@ def main():
 
     with open(ENV_CFG) as f:
         scenario = yaml.safe_load(f)
-    for key in ['location', 'month', 'days_per_episode']:
+    for key in ['location', 'month', 'days_per_episode', 'ci_year']:
         if getattr(args, key) is not None:
             scenario[key] = getattr(args, key)
     scenario['pv_config'] = {**scenario.get('pv_config', {}), 'capacity_kWp': args.pv_capacity_kWp}

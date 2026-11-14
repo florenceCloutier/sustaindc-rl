@@ -14,9 +14,12 @@
 #   SDC_RUNS     where runs go (default: $CODE/results/marl_runs); runs of EXP_NAME go to $SDC_RUNS/EXP_NAME
 #   SBATCH_ARGS  extra sbatch options, e.g. "-p main-cpu,long-cpu"
 #   EXTRA        extra train_single_agent.py arguments for every run (they override the settings below)
+#   PV_KWP       on-site PV capacity in kWp (default 0: no PV). With PV the agents also observe it (include_pv_obs).
+#   INCLUDE_PV   1: PV actions, the battery agent dispatches PV every step (use / battery / resell); needs PV_KWP > 0.
+#                Unset: with PV_KWP > 0, the automatic PV rule. Evaluate with the same PV_KWP / INCLUDE_PV.
 #   DRY_RUN=1    write the job scripts but do not submit
 #
-# Each job: 16 CPUs (15 env processes), 16 GB, TIME. Reward: the env yaml's (co2_team_reward). No PV.
+# Each job: 16 CPUs (15 env processes), 16 GB, TIME. Reward: the env yaml's (co2_team_reward). No PV unless PV_KWP.
 # Hyperparameters: the best single-agent setting of the v2/v4 runs (lr 3e-4, entropy 0.001, clip 0.2, 10 epochs,
 # VecNormalize on observations and rewards); evaluation and checkpoint every 250k env steps.
 # Preemption and time limit: jobs use --run_id $SLURM_JOB_ID; a preempted job (--requeue) or one that reaches TIME
@@ -35,10 +38,20 @@ OUT=${SDC_RUNS:-$CODE/results/marl_runs}/$EXP
 CPUS=16
 
 PPO_ARGS="--algo ppo --n_envs $((CPUS - 1)) --learning_rate 3e-4 --ent_coef 0.001 --clip_range 0.2 --n_epochs 10"
-RUN_ARGS='--pv_capacity_kWp 0 --no-include_pv_obs --eval_freq 250000 --n_eval_episodes 5 --checkpoint_freq 250000'
+PV_KWP=${PV_KWP:-0}
+if awk -v k="$PV_KWP" 'BEGIN { exit !(k > 0) }'; then PV_ON=1; else PV_ON=0; fi
+if [ "${INCLUDE_PV:-0}" = 1 ] && [ $PV_ON = 0 ]; then echo "INCLUDE_PV=1 needs PV_KWP > 0"; exit 1; fi
+PV_DESC="PV ${PV_KWP} kWp$([ "${INCLUDE_PV:-0}" = 1 ] && echo ', PV actions' || true)"
+if [ $PV_ON = 1 ]; then
+  PV_ARGS="--pv_capacity_kWp $PV_KWP --include_pv_obs"
+  if [ "${INCLUDE_PV:-0}" = 1 ]; then PV_ARGS="$PV_ARGS --include_pv"; fi
+else
+  PV_ARGS='--pv_capacity_kWp 0 --no-include_pv_obs'
+fi
+RUN_ARGS="$PV_ARGS --eval_freq 250000 --n_eval_episodes 5 --checkpoint_freq 250000"
 
 mkdir -p "$OUT/jobs" "$OUT/slurm"
-echo "EXP $EXP | single_ppo | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
+echo "EXP $EXP | single_ppo | $PV_DESC | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for loc in $LOCS; do for seed in $SEEDS; do
   name=single_ppo_${loc}_s${seed}
   cat > "$OUT/jobs/$name.sh" <<JOB

@@ -5,6 +5,7 @@
 #
 # Usage:  scripts/single/eval.sh EXP_NAME LOCATION
 #   Slurm: sbatch -c 8 --mem 16G -t 04:00:00 scripts/single/eval.sh grid_v1 az
+# PV_KWP / INCLUDE_PV: set them as for the training runs (see scripts/eval_protocol.sh).
 # SDC_RUNS: as for scripts/single/launch.sh. Results go to $SDC_RUNS/EXP_NAME/eval/LOCATION/single_ppo; merge with
 # the other methods' folders: python eval_compare.py --combine <dirs> --out_dir <dir>
 set -euo pipefail

@@ -1,5 +1,7 @@
 """Model predictive control (MPC) for SustainDC from the single-agent viewpoint: one controller picks the joint
 (load shifting, cooling, battery) action, i.e. one of the 27 actions of SustainDCSingleAgentEnv's Discrete(27) space.
+With agent-dispatched PV (include_pv=True) the joint action also has the PV action (use / battery / resell), so the
+controller picks one of 81 actions (Discrete(81)); the PV action is folded into the battery agent's Discrete(9) action.
 
 Model: a clone of the live simulator. SustainDC.step is deterministic once reset() has drawn the episode's randomness,
 so the clone is an exact model of the data center, queue and battery. What it is told about the future exogenous
@@ -16,9 +18,9 @@ the planner.
 
 Optimizer: receding-horizon cross-entropy method (CEM) over joint-action sequences with move blocking. The horizon
 is split into blocks of `block` steps that each hold one joint action; each block has its own categorical
-distribution over the 27 joint actions (so correlated sub-actions, e.g. "defer + charge", are learned jointly).
-Each replan:
-  1. candidates = the previous best plan shifted by one block (warm start), the do-nothing plan, the 27 constant
+distribution over the 27 (81 with include_pv) joint actions (so correlated sub-actions, e.g. "defer + charge", are
+learned jointly). Each replan:
+  1. candidates = the previous best plan shifted by one block (warm start), the do-nothing plan, the 27 (81) constant
      plans (first iteration only) and samples from the block distributions;
   2. every candidate is rolled out on a fresh clone of the planning model and scored (see cost below), optionally
      in `workers` parallel processes;
@@ -26,7 +28,8 @@ Each replan:
 The first `replan` steps of the best plan found are executed, then the controller replans.
 
 Cost (grams of CO2, minimized):
-  sum over the horizon of   bat_CO2_footprint                     (grid CO2 incl. battery charging/discharging)
+  sum over the horizon of   bat_CO2_footprint                     (grid CO2 incl. battery charging/discharging,
+                                                                   minus the credit of resold PV with include_pv)
                           + drop_w    * task_g * tasks dropped      (deferred while the queue is full: work lost)
                           + overdue_w * task_g * overdue tasks      (tasks older than 24 h, per step)
   + terminal value:         task_g' * tasks still queued            (they must run later)
@@ -56,7 +59,7 @@ Metric-aligned oracle (as in scripts/mpc/oracle_sweep.sh):
 
 Inside a SustainDCSingleAgentEnv, use the joint action directly:
     policy = MPCPolicy(); policy.reset(seed)
-    action = policy.act_joint(env.env)   # Discrete(27) index; env must use action_type='discrete'
+    action = policy.act_joint(env.env)   # Discrete(27) (Discrete(81) with include_pv) index; action_type='discrete'
 """
 import atexit
 import copy
@@ -69,10 +72,18 @@ import time
 import numpy as np
 
 from baseline_policies import dc_power
-from sustaindc_single_env import N_SUB_ACTIONS, decode_joint_action
+from sustaindc_single_env import N_SUB_ACTIONS, decode_joint_action, sub_actions
 
 N_JOINT = int(np.prod(N_SUB_ACTIONS))  # 27
 NOOP_JOINT = int(np.ravel_multi_index((1, 1, 2), N_SUB_ACTIONS))  # ls: do nothing, dc: hold, bat: idle
+
+
+def joint_space(include_pv=False):
+    """(number of joint actions, do-nothing joint action) of the joint action space. With include_pv the do-nothing
+    action uses PV for the DC load (PV action 0, 'use'), as the automatic PV rule does."""
+    n_sub = sub_actions(include_pv)
+    noop = (1, 1, 2, 0) if include_pv else (1, 1, 2)
+    return int(np.prod(n_sub)), int(np.ravel_multi_index(noop, n_sub))
 DAY = 96  # 15-minute steps per day
 FORECASTS = ('oracle', 'persistence')
 END_COSTS = ('proxy', 'metric')
@@ -170,7 +181,7 @@ def rollout_cost(model, shared, plan, params):
     task_g = params['task_g']
     cost = 0.0
     for a in np.repeat(plan, params['block']):
-        _, _, _, truncs, info = sim.step(decode_joint_action(a, 'discrete'))
+        _, _, _, truncs, info = sim.step(decode_joint_action(a, 'discrete', params['include_pv']))
         i = info['agent_ls']
         cost += i['bat_CO2_footprint']
         cost += params['drop_w'] * task_g * i['ls_tasks_dropped']
@@ -371,15 +382,23 @@ class MPCPolicy:
     # -- episode ------------------------------------------------------------------------------------------------------
     def reset(self, seed):
         self.rng = np.random.default_rng(int(seed) + self.seed_offset)
+        self.include_pv = False   # set from the simulator at each replan (agent-dispatched PV: 81 joint actions)
+        self.n_joint, self.noop_joint = joint_space(False)
         self.plan = None          # best plan from the last replan: joint action per block
         self.pending = []         # joint actions still to execute from the current plan
         self.stats = {'replans': 0, 'rollouts': 0, 'plan_seconds': 0.0}
 
     def act(self, sdc):
-        return decode_joint_action(self.act_joint(sdc), 'discrete')
+        a = self.act_joint(sdc)
+        return decode_joint_action(a, 'discrete', self.include_pv)
 
     def act_joint(self, sdc):
-        """Next joint action as a Discrete(27) index (same encoding as SustainDCSingleAgentEnv, action_type='discrete')."""
+        """Next joint action as a Discrete(27) index, or Discrete(81) with include_pv (same encoding as
+        SustainDCSingleAgentEnv, action_type='discrete')."""
+        include_pv = bool(getattr(sdc, 'include_pv', False))
+        if include_pv != self.include_pv:  # a plan for the other action space cannot be continued
+            self.include_pv, (self.n_joint, self.noop_joint) = include_pv, joint_space(include_pv)
+            self.plan, self.pending = None, []
         if not self.pending:
             self._replan(sdc)
         return int(self.pending.pop(0))
@@ -397,7 +416,8 @@ class MPCPolicy:
                                      float(dc.ambient_temp), float(dc.wet_bulb))
         params = {'block': self.block, 'drop_w': self.drop_w, 'overdue_w': self.overdue_w, 'task_kwh': task_kwh,
                   'end_cost': self.end_cost,
-                  'task_g': task_kwh * float(sdc.ci_m.carbon_smooth[sdc.ci_m.time_step])}  # current CI is known
+                  'task_g': task_kwh * float(sdc.ci_m.carbon_smooth[sdc.ci_m.time_step]),  # current CI is known
+                  'include_pv': self.include_pv}
         if self.workers > 1:
             if self._pool is None:
                 self._pool = RolloutPool(self.workers)
@@ -411,8 +431,8 @@ class MPCPolicy:
         t0 = time.time()
         evaluate = self._evaluator(sdc)
         probs = self._initial_probs()
-        seeds = [self._warm_start(), np.full(self.n_blocks, NOOP_JOINT)]
-        seeds += [np.full(self.n_blocks, a) for a in range(N_JOINT)]
+        seeds = [self._warm_start(), np.full(self.n_blocks, self.noop_joint)]
+        seeds += [np.full(self.n_blocks, a) for a in range(self.n_joint)]
         best_plan, best_cost = None, np.inf
         seen = {}
         for it in range(self.iters):
@@ -426,7 +446,8 @@ class MPCPolicy:
             if costs[order[0]] < best_cost:
                 best_cost, best_plan = float(costs[order[0]]), plans[order[0]].copy()
             elite = np.stack([plans[i] for i in order[:self.elites]])
-            freq = np.stack([np.bincount(elite[:, b], minlength=N_JOINT) for b in range(self.n_blocks)]) / len(elite)
+            freq = np.stack([np.bincount(elite[:, b], minlength=self.n_joint)
+                             for b in range(self.n_blocks)]) / len(elite)
             probs = self.smoothing * freq + (1 - self.smoothing) * probs
 
         self.plan = best_plan
@@ -435,26 +456,27 @@ class MPCPolicy:
         self.stats['rollouts'] += len(seen)
         self.stats['plan_seconds'] += time.time() - t0
         if self.verbose:
-            sub = [tuple(int(x) for x in np.unravel_index(a, N_SUB_ACTIONS)) for a in best_plan]
-            print(f'  [mpc] t={sdc.t_m.current_timestep} cost={best_cost / 1e3:.1f} kg plan(ls,dc,bat)={sub} '
+            sub = [tuple(int(x) for x in np.unravel_index(a, sub_actions(self.include_pv))) for a in best_plan]
+            names = '(ls,dc,bat,pv)' if self.include_pv else '(ls,dc,bat)'
+            print(f'  [mpc] t={sdc.t_m.current_timestep} cost={best_cost / 1e3:.1f} kg plan{names}={sub} '
                   f'({len(seen)} rollouts, {time.time() - t0:.2f}s)', flush=True)
 
     def _initial_probs(self):
-        """Uniform over the 27 joint actions, pulled toward the previous plan (shifted by the executed steps)."""
-        probs = np.full((self.n_blocks, N_JOINT), 1.0 / N_JOINT)
+        """Uniform over the joint actions, pulled toward the previous plan (shifted by the executed steps)."""
+        probs = np.full((self.n_blocks, self.n_joint), 1.0 / self.n_joint)
         probs[np.arange(self.n_blocks), self._warm_start()] += 1.0
         return probs / probs.sum(axis=1, keepdims=True)
 
     def _warm_start(self):
         """Previous best plan shifted by the executed steps (rounded to blocks), padded with its last action."""
         if self.plan is None:
-            return np.full(self.n_blocks, NOOP_JOINT)
+            return np.full(self.n_blocks, self.noop_joint)
         shift = min(-(-self.replan // self.block), self.n_blocks)
         return np.concatenate([self.plan[shift:], np.full(shift, self.plan[-1])]).astype(int)
 
     def _sample(self, probs):
         u = self.rng.random((self.n_blocks, 1))
-        return (probs.cumsum(axis=1) < u).sum(axis=1).clip(0, N_JOINT - 1)
+        return (probs.cumsum(axis=1) < u).sum(axis=1).clip(0, self.n_joint - 1)
 
 
 def make_mpc_policy(rest):
