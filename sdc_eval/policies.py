@@ -209,13 +209,14 @@ class HARLPolicy:
         return actions
 
 
-PARAM_SEGMENT = {'rule': 2, 'oracle': 2, 'mpc': 1, 'mpc_joint': 1}  # ':'-separated segment holding key=value parameters
+# ':'-separated segment holding key=value parameters
+PARAM_SEGMENT = {'rule': 2, 'oracle': 2, 'mpc': 1, 'mpc_joint': 1, 'lp_replay': 1}
 
 
 def split_label(spec):
     """Split '<spec>=<label>' into (spec, label). In a key=value parameter list the label is after an extra '=' on the
-    last parameter (rule:bat:bat_lo=0.2=lbl, mpc:value=v.npz=lbl, mpc_joint:forecast=persistence=lbl); otherwise
-    after the first '='."""
+    last parameter (rule:bat:bat_lo=0.2=lbl, mpc:value=v.npz=lbl, mpc_joint:forecast=persistence=lbl,
+    lp_replay:bat_frac=0.2=lbl); otherwise after the first '='."""
     segments = spec.split(':')
     idx = PARAM_SEGMENT.get(segments[0])
     if idx is not None and len(segments) > idx:
@@ -249,6 +250,9 @@ def make_policy(spec):
     elif kind == 'mpc_joint':
         from mpc_policy import make_mpc_policy as make_joint_mpc_policy
         policy = make_joint_mpc_policy(rest)
+    elif kind == 'lp_replay':
+        from sdc_lp_bound import make_lp_policy
+        policy = make_lp_policy(rest)
     else:
         raise ValueError(f'Unknown policy spec {spec!r}')
     return label or spec, policy
