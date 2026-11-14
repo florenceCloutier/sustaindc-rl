@@ -3,7 +3,7 @@
 # single-agent, rules) go into one paired table.
 #
 # Protocol (fixed here, do not change it per method):
-#   10 episodes, seeds 1000..1009, 30 days each, July (month index 6), PV off, one location (az or ny).
+#   10 episodes, seeds 1000..1009, 30 days each, July (month index 6), PV off, one location (az, ny, tx or ca).
 #   Every run also scores noop on the same episodes; results are paired % changes vs noop, metric = work-adjusted CO2.
 #
 # Usage (from anywhere; runs in the repo root):
@@ -23,7 +23,7 @@ if [ $# -lt 3 ]; then
     exit 1
 fi
 LOC=$1; OUT=$2; shift 2
-case $LOC in az|ny) ;; *) echo "LOC must be az or ny (got $LOC)"; exit 1 ;; esac
+case $LOC in az|ny|tx|ca) ;; *) echo "LOC must be az, ny, tx or ca (got $LOC)"; exit 1 ;; esac
 case $OUT in /*) ;; *) OUT=$PWD/$OUT ;; esac
 cd "$(dirname "$0")/.."
 POLICIES=(--policy noop)

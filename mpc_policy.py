@@ -36,12 +36,23 @@ where task_g is the CO2 of running one task (1% of the DC for 15 min) at the mar
 current CI, and CI' / task_g' use the mean (forecast) CI of the 24 h after the horizon. Without the terminal value
 the controller would defer work past the horizon and drain the battery at its end for free.
 
+End of the episode (`end_cost`): with `proxy` (default, the setting of the grid_v1 runs) the terminal value above is
+also used when a rollout reaches the end of the episode (the CI' window is then empty and the last CI is used). With
+`metric`, a rollout that reaches the end of the episode is charged what co2_work_adjusted charges instead: queued
+tasks x the marginal energy of one task at the episode's mean load and ambient (18 C setpoint) x the episode's mean
+CI, computed on the planning model's series (so the persistence forecast only sees its forecast), and the energy
+left in the battery is worth nothing. To plan on the evaluation metric itself, also set drop_w=0 and overdue_w=0:
+"dropped" tasks (deferred into a full queue) run in the same step in envs/carbon_ls.py and overdue tasks are run
+automatically, so co2_work_adjusted charges neither beyond their energy.
+
 Usage (from the repo root), next to the other baselines (policy kind `mpc_joint`; `mpc` is mpc_value.py):
     python eval_compare.py --policy noop --policy mpc_joint=mpc_oracle \\
         --policy mpc_joint:forecast=persistence=mpc_persist --days_per_episode 3
     python eval_compare.py --policy mpc_joint:horizon=96,block=8,samples=64,iters=4,workers=8=mpc_long ...
 Parameters (key=value, comma separated): horizon, block, replan, samples, iters, elites, smoothing, drop_w,
-overdue_w, forecast, forecast_days, workers, seed, verbose. See MPCPolicy.__init__.
+overdue_w, forecast, forecast_days, end_cost, workers, seed, verbose. See MPCPolicy.__init__.
+Metric-aligned oracle (as in scripts/mpc/oracle_sweep.sh):
+    mpc_joint:horizon=96,block=8,replan=4,samples=128,iters=5,end_cost=metric,drop_w=0,overdue_w=0,workers=16
 
 Inside a SustainDCSingleAgentEnv, use the joint action directly:
     policy = MPCPolicy(); policy.reset(seed)
@@ -64,6 +75,7 @@ N_JOINT = int(np.prod(N_SUB_ACTIONS))  # 27
 NOOP_JOINT = int(np.ravel_multi_index((1, 1, 2), N_SUB_ACTIONS))  # ls: do nothing, dc: hold, bat: idle
 DAY = 96  # 15-minute steps per day
 FORECASTS = ('oracle', 'persistence')
+END_COSTS = ('proxy', 'metric')
 
 # Exogenous time series read by the managers during SustainDC.step, indexed by each manager's own time_step.
 EXOGENOUS_SERIES = {
@@ -164,6 +176,8 @@ def rollout_cost(model, shared, plan, params):
         cost += params['drop_w'] * task_g * i['ls_tasks_dropped']
         cost += params['overdue_w'] * task_g * i['ls_overdue_penalty']
         if truncs['__all__']:
+            if params.get('end_cost') == 'metric':
+                return cost + episode_end_task_g(sim) * len(sim.ls_env.tasks_queue)
             break
     # Terminal value at the (forecast) mean CI of the next day. The planning model's CI series is the forecast.
     ci = sim.ci_m.carbon_smooth
@@ -172,6 +186,21 @@ def rollout_cost(model, shared, plan, params):
     cost += params['task_kwh'] * ci_after * len(sim.ls_env.tasks_queue)
     cost -= usable_battery_kwh(sim.bat_env.battery) * ci_after
     return cost
+
+
+def episode_end_task_g(sim):
+    """gCO2 that co2_work_adjusted charges for one task left unexecuted at the end of the episode: its marginal energy
+    at the episode's mean load and ambient (sdc_eval.metrics.task_marginal_kwh) x the episode's mean CI, from the
+    simulator's own series (the planning model's forecast). `sim` is at the end of the episode."""
+    from sdc_eval.metrics import task_marginal_kwh
+    steps = int(sim.t_m.simulated_total_timesteps)  # episode length (t_m.current_timestep is an absolute index)
+
+    def episode_mean(series, time_step):
+        return float(np.mean(series[max(time_step - steps, 0):time_step]))
+    load = episode_mean(sim.workload_m.cpu_smooth, sim.workload_m.time_step)
+    ambient = episode_mean(sim.weather_m.temperature_data, sim.weather_m.time_step)
+    ci = episode_mean(sim.ci_m.carbon_smooth, sim.ci_m.time_step)
+    return task_marginal_kwh(sim, load, ambient) * ci
 
 
 def usable_battery_kwh(battery):
@@ -296,7 +325,8 @@ class MPCPolicy:
     train_config = {}
 
     def __init__(self, horizon=48, block=4, replan=None, samples=32, iters=3, elites=6, smoothing=0.7,
-                 drop_w=10.0, overdue_w=1.0, forecast='oracle', forecast_days=1, workers=0, seed=0, verbose=False):
+                 drop_w=10.0, overdue_w=1.0, forecast='oracle', forecast_days=1, end_cost='proxy', workers=0, seed=0,
+                 verbose=False):
         """
         horizon:       planning horizon in 15-minute steps (rounded up to a whole number of blocks). 48 = 12 h.
         block:         steps each planned joint action is held (move blocking).
@@ -309,6 +339,8 @@ class MPCPolicy:
         overdue_w:     cost per step of each task older than 24 h, in multiples of the CO2 of running it.
         forecast:      'oracle' (true future exogenous inputs) or 'persistence' (past data only).
         forecast_days: days averaged by the persistence forecast.
+        end_cost:      'proxy' (terminal value also at the episode's end) or 'metric' (at the episode's end, charge the
+                       queue as co2_work_adjusted does, no battery credit). See the module doc.
         workers:       rollout processes (0 or 1: in-process). Results do not depend on it.
         seed:          added to the episode seed to seed the CEM sampling.
         """
@@ -320,6 +352,9 @@ class MPCPolicy:
             raise ValueError(f'replan must be in [1, horizon={self.horizon}], got {self.replan}')
         if forecast not in FORECASTS:
             raise ValueError(f'forecast must be one of {FORECASTS}, got {forecast!r}')
+        if end_cost not in END_COSTS:
+            raise ValueError(f'end_cost must be one of {END_COSTS}, got {end_cost!r}')
+        self.end_cost = end_cost
         if int(forecast_days) < 1:
             raise ValueError(f'forecast_days must be >= 1, got {forecast_days}')
         self.samples, self.iters = int(samples), int(iters)
@@ -361,6 +396,7 @@ class MPCPolicy:
         task_kwh = marginal_task_kwh(sdc, float(sdc.ls_env.workload), float(dc.raw_curr_stpt),
                                      float(dc.ambient_temp), float(dc.wet_bulb))
         params = {'block': self.block, 'drop_w': self.drop_w, 'overdue_w': self.overdue_w, 'task_kwh': task_kwh,
+                  'end_cost': self.end_cost,
                   'task_g': task_kwh * float(sdc.ci_m.carbon_smooth[sdc.ci_m.time_step])}  # current CI is known
         if self.workers > 1:
             if self._pool is None:
@@ -426,7 +462,7 @@ def make_mpc_policy(rest):
     params = dict(kv.split('=', 1) for kv in rest.split(',') if kv) if rest else {}
     ints = {'horizon', 'block', 'replan', 'samples', 'iters', 'elites', 'seed', 'forecast_days', 'workers'}
     floats = {'smoothing', 'drop_w', 'overdue_w'}
-    strings = {'forecast'}
+    strings = {'forecast', 'end_cost'}
     valid = ints | floats | strings | {'verbose'}
     unknown = set(params) - valid
     if unknown:

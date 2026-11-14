@@ -27,6 +27,8 @@ Policy specs:
     setpoint:<C>                  hold the CRAC setpoint at <C>, everything else does nothing
     mpc_joint[:<params>]          MPC (CEM over the joint action) on a simulator clone, e.g. mpc_joint:horizon=96,
                                   mpc_joint:forecast=persistence (past data only), mpc_joint:workers=8 (see mpc_policy.py)
+    lp_replay[:<params>]          replay of the perfect-foresight LP's plan (sdc_lp_bound.py; the LP's optimum, a lower
+                                  bound on co2_work_adjusted, is computed by `python sdc_lp_bound.py`)
 Add =<label> to any spec to name it in the table, e.g. harl:<dir>=happo. See baseline_policies.py for the controllers.
 
 Each policy is compared with `noop` episode by episode (paired), which removes the episode-to-episode variation:
