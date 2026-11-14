@@ -180,6 +180,9 @@ def main():
     p.add_argument('--include_pv', action=argparse.BooleanOptionalAction, default=None,
                    help="--include_pv: PV on, dispatched by the battery agent's PV action (use/battery/resell; "
                         "needs --pv_capacity_kWp > 0). --no-include_pv: no PV. Default: the env yaml (automatic PV rule).")
+    p.add_argument('--ci_year', type=int, default=None,
+                   help='Year of the carbon intensity data (default: the env yaml, 2022). 2023: held-out test year '
+                        '(locations ca and tx).')
     p.add_argument('--out_dir', default=None, help='Default: <out_root>/eval_compare/<timestamp>')
     p.add_argument('--save_decisions', action=argparse.BooleanOptionalAction, default=True,
                    help='Save every step\'s decisions (actions + context) to <out_dir>/decisions.csv.gz '
@@ -195,7 +198,7 @@ def main():
 
     with open(ENV_CFG) as f:
         scenario = yaml.safe_load(f)
-    for key in ['location', 'month', 'days_per_episode']:
+    for key in ['location', 'month', 'days_per_episode', 'ci_year']:
         if getattr(args, key) is not None:
             scenario[key] = getattr(args, key)
     if args.pv_capacity_kWp is not None:

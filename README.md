@@ -241,6 +241,15 @@ Below is a summary of the selected locations, typical weather values, and carbon
 
 </div>
 
+**Held-out test year (`ci_year`).** All CI files are 2022 data, so training, model selection and evaluation episodes replay
+the same CI days. `ci_year: 2023` (env config, `eval_compare.py --ci_year 2023`, or `CI_YEAR=2023` for
+`scripts/eval_protocol.sh`) loads 2023 CI instead, for California (`CA` = `CISO`) and Texas (`TX` = `ERCO`): policies
+trained on 2022 are then tested on July 2023 CI, with the same weather and workload. The 2023 files were built from
+EIA-930 hourly generation by fuel with `scripts/build_ci_eia930.py`, which reproduces the 2022 `CISO` and `ERCO` files
+exactly (lifecycle emission factors per fuel; battery discharge counted in "Other", charging clipped, as in 2022). In the
+July episode window, mean CI is 3-5% lower in 2023 than in 2022; the mean daily swing is 12% smaller in California
+(more hydro and battery discharge) and 10% larger in Texas (more solar). The default (`ci_year: null`) is 2022.
+
 #### On-site Solar PV
 **SustainDC** can simulate an on-site solar PV array next to the DC. No extra dataset is needed. The `.epw` weather files already contain hourly global, direct and diffuse irradiance (GHI/DNI/DHI), air temperature and wind speed. Their header gives each site's latitude, longitude, time zone and elevation. PV output therefore comes from the same weather the cooling model sees: cloudy hours are also cool hours, and PV follows the same random day shift as the temperature in every episode.
 
@@ -305,7 +314,7 @@ With `include_pv: True`, the battery agent picks a PV action every step:
 | *battery* (1) | PV charges the battery first, up to its charge limit. A *charge* action tops it up from the grid; *discharge* is overridden, because the battery cannot charge and discharge in the same step. PV the battery cannot take supplies the DC load. |
 | *resell* (2) | All PV is sold to the grid. It is renewable energy, so it is credited against CO2 at `pv_resell_credit` × the current carbon intensity (default 0.5, so that using PV on site or storing it is worth more than reselling it; at 1.0 every PV action is worth the same except to avoid curtailment). The DC load and the battery then run as if there were no PV. |
 
-The battery agent's action is `battery_action + 3 × pv_action`, so actions 0–2 are the usual battery actions with PV *use*. Existing rule-based controllers and the joint MPC (`mpc_joint`) therefore keep working, but they never choose *battery* or *resell*. The learned-value MPC (`mpc:`, `mpc_value.py`) plans with PV in both modes: with the automatic rule, and with `include_pv: True`, where its battery planner picks among all 9 battery × PV actions. Train its value with PV using `train_mpc_value.py --pv_capacity_kWp 500 [--include_pv]`. `BatOracle` refuses to run with `include_pv: True`, because it models the automatic rule. The single-agent env gets a 4th sub-action: `MultiDiscrete([3, 3, 3, 3])`, or `Discrete(81)`. In HARL, supersuit pads every agent to 9 actions. The padded actions of the load-shifting and cooling agents are masked through the available-actions mask. `pv_export_credit` is ignored in this mode.
+The battery agent's action is `battery_action + 3 × pv_action`, so actions 0–2 are the usual battery actions with PV *use*. Existing rule-based controllers therefore keep working, but they never choose *battery* or *resell*. Both MPCs plan with the PV actions. The learned-value MPC (`mpc:`, `mpc_value.py`) plans with PV in both modes: with the automatic rule, and with `include_pv: True`, where its battery planner picks among all 9 battery × PV actions. Train its value with PV using `train_mpc_value.py --pv_capacity_kWp 500 [--include_pv]`, or `PV_KWP=500 INCLUDE_PV=1 scripts/mpc/launch.sh ...`. The joint MPC (`mpc_joint`, `mpc_policy.py`) searches the 81 joint (load shifting, cooling, battery, PV) actions with `include_pv: True` (27 otherwise); its rollouts run on a clone of the simulator, so their cost includes the resale credit. `BatOracle` refuses to run with `include_pv: True`, because it models the automatic rule. The single-agent env gets a 4th sub-action: `MultiDiscrete([3, 3, 3, 3])`, or `Discrete(81)`. In HARL, supersuit pads every agent to 9 actions. The padded actions of the load-shifting and cooling agents are masked through the available-actions mask. `pv_export_credit` is ignored in this mode.
 
 The info dict adds `pv_action` (0/1/2, or -1 when PV is not dispatched), `pv_a_t` (the action's name) and `pv_export_credit_gCO2`. Resold PV is reported in `pv_exported_KWh`. The credit is included in `bat_CO2_footprint`, and so in `co2_team_reward`. The default rewards use grid energy only (`bat_total_energy_with_battery_KWh`), so they see *resell* as plain grid import and give it no credit. Use `co2_team_reward` when resale should pay off.
 
@@ -315,6 +324,7 @@ The info dict adds `pv_action` (0/1/2, or -1 when PV is not dispatched), `pv_a_t
 - HARL: pass keys directly, e.g. `--capacity_kWp 500 --include_pv_obs True`.
 - `train_single_agent.py`, `train_mpc_value.py` and `eval_compare.py`: use `--pv_capacity_kWp 500`. All three take `--include_pv` / `--no-include_pv`. `train_single_agent.py` also takes `--include_pv_obs`.
 - Example: `python train_single_agent.py --pv_capacity_kWp 1000 --include_pv --include_pv_obs` (HARL: `--capacity_kWp 1000 --include_pv True --include_pv_obs True`).
+- Slurm launchers (`scripts/{marl,single,mpc}/launch.sh`) and evaluation (`scripts/*/eval.sh`, `scripts/eval_protocol.sh`): set `PV_KWP=1000` (PV on, observed by the RL agents) and `INCLUDE_PV=1` (PV actions). Use the same values for training and evaluation.
 
 
 ## Customization
@@ -584,7 +594,7 @@ sbatch -c 8 --mem 16G -t 12:00:00 scripts/marl/eval.sh marl_co2 az happo
 Runs go to `$SDC_RUNS/<exp>` (default `results/marl_runs/<exp>`): job scripts, Slurm logs, HARL run directories and a
 `manifest.tsv` of job ids. Live logging goes to wandb (`pip install wandb`; `WANDB_ENTITY`, `WANDB_PROJECT`), or set
 `WANDB=0`. Jobs read the code when they start, so to keep editing while jobs wait, pin a copy:
-`git worktree add ../code-$(git rev-parse --short HEAD) HEAD` and launch with `CODE=../code-<sha>`. Other options
+`git worktree add ../code-$(git rev-parse --short HEAD) HEAD` and launch with `CODE=../code-<sha>`. For a PV scenario add `PV_KWP=<kWp>` and `INCLUDE_PV=1` (PV actions) to both commands. Other options
 (`SBATCH_ARGS`, `EXTRA`, `DRY_RUN=1`) are described at the top of the script.
 
 ### All methods on Slurm (single-agent PPO and learned MPC next to MARL)
@@ -631,6 +641,10 @@ scripts/eval_protocol.sh az results/eval_protocol/az/single_ppo \
 # merge result folders for the same location into one paired table
 python eval_compare.py --combine <out_dir_1> <out_dir_2> ... --out_dir <combined_dir>
 ```
+
+For a PV scenario, set `PV_KWP=<kWp>` (on-site PV capacity) and optionally `INCLUDE_PV=1` (PV actions) for both
+training and evaluation, e.g. `PV_KWP=500 INCLUDE_PV=1 scripts/mpc/eval.sh grid_pv az`. Results are only comparable
+between runs with the same PV settings, so use a separate experiment name for each PV scenario.
 
 Each output folder has `summary.json` (means, paired changes and 95% CIs) and `episodes.csv` (per-episode metrics).
 The combined table checks that the workload, weather and carbon-intensity inputs were identical for every policy.

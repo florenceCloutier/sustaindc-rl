@@ -54,3 +54,5 @@ include_pv: null
 # include_pv True only: CO2 credit of resold PV, as a fraction of the current CI. Below 1 so that using PV on
 # site or storing it beats reselling it (at 1.0 every PV action is worth the same except to avoid curtailment).
 pv_resell_credit: 0.5
+# Year of the carbon intensity data: null = 2022 (the default files); 2023 = held-out test year (CA and TX only).
+ci_year: null

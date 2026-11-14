@@ -121,6 +121,11 @@ class EnvConfig(dict):
         # (1.0 = resold renewable energy displaces the same amount of grid energy; then every PV action is worth
         # the same except to avoid curtailment, so the default is 0.5: export pays less than self-consumption).
         'pv_resell_credit': 0.5,
+
+        # Year of the carbon intensity data. None (default) = the 2022 files (data/CarbonIntensity/<CI>_NG_&_avgCI.csv);
+        # another year loads <CI>_<year>_NG_&_avgCI.csv (2023: CA/CISO and TX/ERCO, built with
+        # scripts/build_ci_eia930.py), e.g. a held-out test year for policies trained on 2022.
+        'ci_year': None,
     }
 
     def __init__(self, raw_config):
@@ -181,6 +186,14 @@ class SustainDC(gym.Env):
         self._agent_ids = set(self.agents)
 
         ci_loc, wea_loc = obtain_paths(self.location)
+        self.ci_year = env_config.get('ci_year')
+        if self.ci_year is not None and int(self.ci_year) != 2022:
+            ci_loc = f'{ci_loc}_{int(self.ci_year)}'
+            ci_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'CarbonIntensity',
+                                   f'{ci_loc}_NG_&_avgCI.csv')
+            if not os.path.isfile(ci_path):
+                raise ValueError(f"No carbon intensity data for location {self.location!r} in {self.ci_year}: "
+                                 f"{ci_path} does not exist (see scripts/build_ci_eia930.py).")
         
         ls_reward_method = env_config.get('ls_reward', 'co2_team_reward')
         self.ls_reward_method = reward_creator.get_reward_method(ls_reward_method)
