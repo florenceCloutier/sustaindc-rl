@@ -8,8 +8,8 @@ import yaml
 
 import utils.reward_creator as rc
 from eval_compare import NoOpPolicy, run_episode, split_label
-from mpc_policy import (DAY, EXOGENOUS_SERIES, MPCPolicy, SimCloner, make_mpc_policy, persistence_forecast,
-                        planning_model)
+from mpc_policy import (DAY, EXOGENOUS_SERIES, NOOP_JOINT, MPCPolicy, SimCloner, joint_space, make_mpc_policy,
+                        persistence_forecast, planning_model)
 from sustaindc_env import SustainDC
 from sustaindc_single_env import AGENTS, decode_joint_action
 
@@ -23,10 +23,10 @@ def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
 
 
-def trajectory(sdc, actions):
+def trajectory(sdc, actions, include_pv=False):
     out = []
     for a in actions:
-        _, _, _, _, info = sdc.step(decode_joint_action(a, 'discrete'))
+        _, _, _, _, info = sdc.step(decode_joint_action(a, 'discrete', include_pv))
         i = info['agent_ls']
         out.append((i['bat_CO2_footprint'], i['ls_tasks_in_queue'], i['bat_SOC'], i['dc_crac_setpoint']))
     return np.array(out)
@@ -151,6 +151,43 @@ def main():
         parallel.close()
     check("identical episode metrics with workers=4", m_par == m_serial)
     print(f"     planning time: serial {serial.stats['plan_seconds']:.1f}s, 4 workers {parallel.stats['plan_seconds']:.1f}s")
+
+    print("6. Agent-dispatched PV (include_pv): 81 joint actions, the PV action reaches the env")
+    pv_act = {**SCENARIO, 'location': 'az', 'pv_config': {'capacity_kWp': 1000}, 'include_pv': True}
+    check("joint space: 27 without PV, 81 with PV actions; do-nothing uses PV",
+          joint_space(False) == (27, NOOP_JOINT) and joint_space(True)[0] == 81
+          and decode_joint_action(joint_space(True)[1], 'discrete', True) == {'agent_ls': 1, 'agent_dc': 1, 'agent_bat': 2})
+    random.seed(3); np.random.seed(3)
+    sdc = SustainDC(dict(pv_act)); sdc.reset()
+    for _ in range(40):  # into daylight
+        sdc.step({'agent_ls': 1, 'agent_dc': 1, 'agent_bat': 2})
+    actions = np.random.default_rng(1).integers(81, size=40)
+    clone = SimCloner.clone(sdc)
+    t_clone = trajectory(clone, actions, include_pv=True)
+    t_live = trajectory(sdc, actions, include_pv=True)
+    check("clone is exact with PV actions (incl. resale credit)", np.allclose(t_clone, t_live),
+          f"max diff {np.abs(t_clone - t_live).max():.3g}")
+    env = SustainDC(dict(pv_act))
+    noop, _ = run_episode(env, NoOpPolicy(), 1000)
+    pv_seen, bat_seen = [], []
+
+    class Traced(MPCPolicy):
+        def act(self, sdc):
+            a = super().act(sdc)
+            bat_seen.append(a['agent_bat'])
+            return a
+    mpc = Traced(horizon=32, block=4, samples=16, iters=2, forecast='persistence')
+    m, _ = run_episode(env, mpc, 1000)
+    pv_ids = np.array(bat_seen) // 3
+    check("MPC plans over 81 actions and sends Discrete(9) battery actions",
+          mpc.n_joint == 81 and mpc.include_pv and max(bat_seen) <= 8, f"battery actions used {sorted(set(bat_seen))}")
+    check("PV actions beyond 'use' are chosen", (pv_ids > 0).any(),
+          f"use/battery/resell = {np.bincount(pv_ids, minlength=3).tolist()}")
+    check("work-adjusted CO2 lower than noop with PV actions", m['co2_work_adjusted'] < noop['co2_work_adjusted'],
+          f"{m['co2_work_adjusted']:.1f} vs {noop['co2_work_adjusted']:.1f} kg")
+    plain = MPCPolicy(horizon=32, block=4, samples=16, iters=2, forecast='persistence')
+    run_episode(SustainDC(dict(SCENARIO)), plain, 1000)
+    check("without PV the space stays 27 actions", plain.n_joint == 27 and not plain.include_pv)
 
     print(f"\n{sum(results)}/{len(results)} checks passed")
     return all(results)

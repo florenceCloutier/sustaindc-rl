@@ -17,6 +17,9 @@
 #   WANDB_PROJECT (default sustaindc-rl), WANDB_ENTITY (default: your wandb default entity)
 #   SBATCH_ARGS  extra sbatch options, e.g. "-p long-cpu" or "--account=..."
 #   EXTRA        extra train_sustaindc.py arguments for every run
+#   PV_KWP       on-site PV capacity in kWp (default 0: no PV). With PV the agents also observe it (include_pv_obs).
+#   INCLUDE_PV   1: PV actions, the battery agent dispatches PV every step (use / battery / resell); needs PV_KWP > 0.
+#                Unset: with PV_KWP > 0, the automatic PV rule. Evaluate with the same PV_KWP / INCLUDE_PV.
 #   DRY_RUN=1    write the job scripts but do not submit
 #
 # Each job: 16 CPUs, 32 GB, TIME for on-policy algorithms (HAPPO/MAPPO), 2 days for off-policy (HAD3QN).
@@ -40,6 +43,15 @@ case $REWARD in
   default) REWARD_ARGS='--ls_reward default_ls_reward --dc_reward default_dc_reward --bat_reward default_bat_reward' ;;
   *) echo "REWARD must be co2 or default (got $REWARD)"; exit 1 ;;
 esac
+PV_KWP=${PV_KWP:-0}
+if awk -v k="$PV_KWP" 'BEGIN { exit !(k > 0) }'; then PV_ON=1; else PV_ON=0; fi
+if [ "${INCLUDE_PV:-0}" = 1 ] && [ $PV_ON = 0 ]; then echo "INCLUDE_PV=1 needs PV_KWP > 0"; exit 1; fi
+PV_DESC="PV ${PV_KWP} kWp$([ "${INCLUDE_PV:-0}" = 1 ] && echo ', PV actions' || true)"
+PV_ARGS=''   # no PV: nothing passed, the env yaml has PV off
+if [ $PV_ON = 1 ]; then
+  PV_ARGS="--capacity_kWp $PV_KWP --include_pv_obs True"
+  if [ "${INCLUDE_PV:-0}" = 1 ]; then PV_ARGS="$PV_ARGS --include_pv True"; fi
+fi
 WANDB=${WANDB:-1}
 if [ "$WANDB" = 1 ]; then
   "$PY" -c 'import wandb' 2>/dev/null || { echo "wandb is not installed in $PY (pip install wandb, or WANDB=0)"; exit 1; }
@@ -54,10 +66,10 @@ PPO_ARGS='--hidden_sizes [64,64] --initialization_method xavier_uniform_ --lr 0.
 RUN_ARGS='--n_rollout_threads 12 --episode_length 1024 --n_eval_rollout_threads 5 --eval_episodes 5'
 
 mkdir -p "$OUT/jobs" "$OUT/slurm"
-echo "EXP $EXP | reward $REWARD | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
+echo "EXP $EXP | reward $REWARD | $PV_DESC | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for algo in $ALGOS; do for loc in $LOCS; do for seed in $SEEDS; do
   name=${algo}_${loc}_s${seed}
-  extra="$RUN_ARGS $REWARD_ARGS ${EXTRA:-}"; time=$TIME_ONPOL
+  extra="$RUN_ARGS $REWARD_ARGS $PV_ARGS ${EXTRA:-}"; time=$TIME_ONPOL
   if [[ $algo == happo || $algo == mappo ]]; then extra="$extra $PPO_ARGS"; fi
   if [[ $algo == had3qn ]]; then time=2-00:00:00; fi   # off-policy is ~1.5-2x slower per env step
   cat > "$OUT/jobs/$name.sh" <<JOB

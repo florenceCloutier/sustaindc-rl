@@ -7,6 +7,8 @@
 # Usage:  scripts/mpc/eval.sh EXP_NAME LOCATION
 #   Slurm: sbatch -c 8 --mem 16G -t 04:00:00 scripts/mpc/eval.sh grid_v1 az
 # SDC_RUNS: as for scripts/mpc/launch.sh. Results go to $SDC_RUNS/EXP_NAME/eval/LOCATION/mpc.
+# PV_KWP / INCLUDE_PV: set them as for the training runs (see scripts/eval_protocol.sh); a value trained with PV
+# refuses a scenario without PV.
 set -euo pipefail
 if [ $# -ne 2 ]; then sed -n '2,9p' "$0"; exit 1; fi
 EXP=$1; LOC=$2
