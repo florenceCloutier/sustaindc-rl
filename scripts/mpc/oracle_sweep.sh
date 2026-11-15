@@ -73,8 +73,8 @@ fi
 case $MONTH in all) echo "MONTH=all is for training; use a fixed month or MONTH=cycle"; exit 1 ;; esac
 SCEN_ENV="PV_KWP=$PV_KWP INCLUDE_PV=$INCLUDE_PV MONTH=$MONTH N_EPISODES=$N_EPISODES${CI_YEAR:+ CI_YEAR=$CI_YEAR}${WORKLOAD_FILE:+ WORKLOAD_FILE=$WORKLOAD_FILE}"
 # Select mode: the same scenario on the tuning seeds (one episode per month with cycle).
-SEL_N=5; [ "$MONTH" = cycle ] && SEL_N=12
-SEL_ARGS="--month $MONTH --pv_capacity_kWp $PV_KWP$([ "$INCLUDE_PV" = 1 ] && echo ' --include_pv')${CI_YEAR:+ --ci_year $CI_YEAR}${WORKLOAD_FILE:+ --workload_file $WORKLOAD_FILE}"
+SEL_N=5; if [ "$MONTH" = cycle ]; then SEL_N=12; fi
+SEL_ARGS="--month $MONTH --pv_capacity_kWp $PV_KWP$([ "$INCLUDE_PV" = 1 ] && echo ' --include_pv' || true)${CI_YEAR:+ --ci_year $CI_YEAR}${WORKLOAD_FILE:+ --workload_file $WORKLOAD_FILE}"
 echo "EXP $EXP | mpc_joint sweep ($MODE) | $SCEN_ENV | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for loc in $LOCS; do
   case $loc in az|ny|tx|ca) ;; *) echo "LOCATION must be az, ny, tx or ca (got $loc)"; exit 1 ;; esac
