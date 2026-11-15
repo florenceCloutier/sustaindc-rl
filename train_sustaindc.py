@@ -101,9 +101,11 @@ def main():
     def process(arg):
         """Evaluate the argument if possible, otherwise return the argument as is."""
         try:
-            return eval(arg)
+            value = eval(arg)
         except:
             return arg
+        # Names of builtins (e.g. --month all) evaluate to functions: keep them as strings.
+        return arg if callable(value) else value
 
     # Process unparsed arguments to a dictionary
     keys = [k[2:] for k in unparsed_args[0::2]]  # remove -- from argument

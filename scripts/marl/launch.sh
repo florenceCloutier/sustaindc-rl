@@ -20,6 +20,7 @@
 #   PV_KWP       on-site PV capacity in kWp (default 0: no PV). With PV the agents also observe it (include_pv_obs).
 #   INCLUDE_PV   1: PV actions, the battery agent dispatches PV every step (use / battery / resell); needs PV_KWP > 0.
 #                Unset: with PV_KWP > 0, the automatic PV rule. Evaluate with the same PV_KWP / INCLUDE_PV.
+#   MONTH        training month: 0..11, or all (episodes start anywhere in the year). Default: the env yaml's (6, July).
 #   DRY_RUN=1    write the job scripts but do not submit
 #
 # Each job: 16 CPUs, 32 GB, TIME for on-policy algorithms (HAPPO/MAPPO), 2 days for off-policy (HAD3QN).
@@ -28,7 +29,7 @@
 # Outputs: $SDC_RUNS/EXP_NAME/{jobs,slurm,runs}, plus manifest.tsv (job id, algo, location, seed, steps, time).
 # Evaluate finished runs with scripts/marl/eval.sh (the shared protocol of scripts/eval_protocol.sh).
 set -euo pipefail
-if [ $# -ne 6 ]; then sed -n '2,29p' "$0"; exit 1; fi
+if [ $# -ne 6 ]; then sed -n '2,30p' "$0"; exit 1; fi
 EXP=$1; STEPS=$2; TIME_ONPOL=$3; ALGOS=$4; LOCS=$5; SEEDS=$6
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -63,10 +64,10 @@ fi
 # Shared PPO settings (HAPPO and MAPPO). lr 3e-4 and entropy 0.01: with 3e-5 / 0.1 the policies stayed near-uniform.
 PPO_ARGS='--hidden_sizes [64,64] --initialization_method xavier_uniform_ --lr 0.0003 --critic_lr 0.0003 --clip_param 0.5 --actor_num_mini_batch 8 --critic_num_mini_batch 8 --entropy_coef 0.01 --eval_interval 10'
 # Shared run settings (all algorithms). HAD3QN keeps its own settings from harl/configs/algos_cfgs/had3qn.yaml.
-RUN_ARGS='--n_rollout_threads 12 --episode_length 1024 --n_eval_rollout_threads 5 --eval_episodes 5'
+RUN_ARGS="--n_rollout_threads 12 --episode_length 1024 --n_eval_rollout_threads 5 --eval_episodes 5${MONTH:+ --month $MONTH}"
 
 mkdir -p "$OUT/jobs" "$OUT/slurm"
-echo "EXP $EXP | reward $REWARD | $PV_DESC | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
+echo "EXP $EXP | reward $REWARD | month ${MONTH:-yaml} | $PV_DESC | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for algo in $ALGOS; do for loc in $LOCS; do for seed in $SEEDS; do
   name=${algo}_${loc}_s${seed}
   extra="$RUN_ARGS $REWARD_ARGS $PV_ARGS ${EXTRA:-}"; time=$TIME_ONPOL

@@ -180,6 +180,13 @@ class SustainDC(gym.Env):
             self.month = int((env_config.worker_index - 1) % 12)
         else:
             self.month = env_config.get('month')
+        # month 'all': every episode starts on a random day of the whole year (see ranges_day below); the sub-envs
+        # only use the month for an initial index, so they get January.
+        self.full_year = str(self.month).lower() == 'all'
+        if self.full_year:
+            self.month = 0
+        else:
+            self.month = int(self.month)
 
         self.evaluation_mode = env_config['evaluation']
 
@@ -285,8 +292,16 @@ class SustainDC(gym.Env):
         # dc_state[4:9] & bat_state[5]->5+1 variables
 
         # Create the managers: date/hour/time manager, workload manager, weather manager, and CI manager.
-        self.init_day = get_init_day(self.month)
-        self.ranges_day = [max(0, self.init_day - 7), min(364, self.init_day + 7)]
+        # Episode start day: within +-7 days of the month's first day, or anywhere in the year with month 'all'. The
+        # last start day keeps the episode (and the managers' few-hours lookahead) inside the year's data: past it the
+        # managers wrap inconsistently (workload to the episode start, CI to the month start).
+        last_start = 364 - int(self.days_per_episode) - 1
+        if self.full_year:
+            self.init_day = 0
+            self.ranges_day = [0, last_start]
+        else:
+            self.init_day = get_init_day(self.month)
+            self.ranges_day = [max(0, self.init_day - 7), min(last_start, self.init_day + 7)]
         self.t_m = Time_Manager(self.init_day, timezone_shift=self.timezone_shift, days_per_episode=self.days_per_episode)
         self.workload_m = Workload_Manager(init_day=self.init_day, workload_filename=self.workload_file, timezone_shift=self.timezone_shift)
         self.weather_m = Weather_Manager(init_day=self.init_day, location=wea_loc, filename=self.weather_file, timezone_shift=self.timezone_shift)

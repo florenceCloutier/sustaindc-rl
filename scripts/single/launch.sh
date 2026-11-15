@@ -17,6 +17,7 @@
 #   PV_KWP       on-site PV capacity in kWp (default 0: no PV). With PV the agents also observe it (include_pv_obs).
 #   INCLUDE_PV   1: PV actions, the battery agent dispatches PV every step (use / battery / resell); needs PV_KWP > 0.
 #                Unset: with PV_KWP > 0, the automatic PV rule. Evaluate with the same PV_KWP / INCLUDE_PV.
+#   MONTH        training month: 0..11, or all (episodes start anywhere in the year). Default: the env yaml's (6, July).
 #   DRY_RUN=1    write the job scripts but do not submit
 #
 # Each job: 16 CPUs (15 env processes), 16 GB, TIME. Reward: the env yaml's (co2_team_reward). No PV unless PV_KWP.
@@ -26,7 +27,7 @@
 # (requeued by the USR1 trap 5 min before) resumes from its latest checkpoint.
 # Outputs: $SDC_RUNS/EXP_NAME/{jobs,slurm,runs}, manifest.tsv. Evaluate with scripts/single/eval.sh.
 set -euo pipefail
-if [ $# -ne 5 ]; then sed -n '2,25p' "$0"; exit 1; fi
+if [ $# -ne 5 ]; then sed -n '2,26p' "$0"; exit 1; fi
 EXP=$1; STEPS=$2; TIME=$3; LOCS=$4; SEEDS=$5
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -48,10 +49,10 @@ if [ $PV_ON = 1 ]; then
 else
   PV_ARGS='--pv_capacity_kWp 0 --no-include_pv_obs'
 fi
-RUN_ARGS="$PV_ARGS --eval_freq 250000 --n_eval_episodes 5 --checkpoint_freq 250000"
+RUN_ARGS="$PV_ARGS ${MONTH:+--month $MONTH} --eval_freq 250000 --n_eval_episodes 5 --checkpoint_freq 250000"
 
 mkdir -p "$OUT/jobs" "$OUT/slurm"
-echo "EXP $EXP | single_ppo | $PV_DESC | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
+echo "EXP $EXP | single_ppo | month ${MONTH:-yaml} | $PV_DESC | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for loc in $LOCS; do for seed in $SEEDS; do
   name=single_ppo_${loc}_s${seed}
   cat > "$OUT/jobs/$name.sh" <<JOB

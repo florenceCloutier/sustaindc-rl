@@ -42,6 +42,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from sdc_eval.config import add_config_args, load_config, merge, parse_overrides
 from sdc_eval.constants import ENV_CFG, EVAL_EVERY_STEPS, TRAIN_EVAL_SEED
 from sdc_eval.evaluator import FixedSeedEvaluator
+from sdc_eval.protocol import parse_month
 from sdc_eval.logger import RunLogger
 from sdc_eval.paths import resolve_root
 from sdc_eval.sb3 import CommonEvalCallback, CommonMetricsCallback
@@ -177,7 +178,8 @@ def main():
     p.add_argument('--n_envs', type=int, default=8)
     p.add_argument('--total_timesteps', type=int, default=5_000_000)
     p.add_argument('--location', default=None, help='Override env config location (ny, ca, az, ga, ...).')
-    p.add_argument('--month', type=int, default=None, help='Override env config month (0-11).')
+    p.add_argument('--month', type=parse_month, default=None,
+                   help='Override env config month: 0..11, or all (episodes start anywhere in the year).')
     p.add_argument('--days_per_episode', type=int, default=None)
     p.add_argument('--action_type', choices=['multidiscrete', 'discrete'], default='multidiscrete',
                    help='Joint action encoding. DQN always uses discrete.')

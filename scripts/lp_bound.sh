@@ -9,9 +9,10 @@
 # Writes OUT_DIR/bound/{bound.json,bound.csv} (per-episode bound and its paired % vs noop) and OUT_DIR/replay/
 # (eval_compare output: noop + lp_replay; merge it with the other folders with eval_compare.py --combine).
 # SKIP_REPLAY=1 computes the bound only. CI_YEAR=2023: the held-out carbon intensity year (as scripts/eval_protocol.sh).
-# PV off only (the LP does not model PV).
+# MONTH, N_EPISODES, WORKLOAD_FILE: as for scripts/eval_protocol.sh (same episodes). PV off only (the LP does not
+# model PV).
 set -euo pipefail
-if [ $# -ne 2 ]; then sed -n '2,13p' "$0"; exit 1; fi
+if [ $# -ne 2 ]; then sed -n '2,14p' "$0"; exit 1; fi
 [ "${PV_KWP:-0}" = 0 ] || { echo "lp_bound supports PV off only (got PV_KWP=$PV_KWP)"; exit 1; }
 LOC=$1; OUT=$2
 case $LOC in az|ny|tx|ca) ;; *) echo "LOC must be az, ny, tx or ca (got $LOC)"; exit 1 ;; esac
@@ -20,8 +21,10 @@ cd "$(dirname "$0")/.."
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 echo "lp_bound: $LOC | code $(git rev-parse --short HEAD 2>/dev/null || echo '?') | host $(hostname) | $(date)"
 # Same scenario and seeds as scripts/eval_protocol.sh.
-python -u sdc_lp_bound.py --location "$LOC" --month 6 --days_per_episode 30 --pv_capacity_kWp 0 \
-    ${CI_YEAR:+--ci_year "$CI_YEAR"} --n_episodes 10 --seed 1000 --out_dir "$OUT/bound"
+case ${MONTH:-6} in all) echo "MONTH=all is for training; use a fixed month or MONTH=cycle"; exit 1 ;; esac
+python -u sdc_lp_bound.py --location "$LOC" --month "${MONTH:-6}" --days_per_episode 30 --pv_capacity_kWp 0 \
+    ${CI_YEAR:+--ci_year "$CI_YEAR"} ${WORKLOAD_FILE:+--workload_file "$WORKLOAD_FILE"} \
+    --n_episodes "${N_EPISODES:-10}" --seed 1000 --out_dir "$OUT/bound"
 if [ "${SKIP_REPLAY:-0}" != 1 ]; then
   scripts/eval_protocol.sh "$LOC" "$OUT/replay" "lp_replay=lp_replay"
 fi

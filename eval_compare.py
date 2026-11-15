@@ -56,6 +56,7 @@ import yaml
 from sdc_eval.constants import ENV_CFG, FINAL_EVAL_SEED, NOOP, SCENARIO_KEYS, STEP_HOURS
 from sdc_eval.metrics import METRICS, PAIRED_METRICS, aggregate, marginal_kwh_per_util_step
 from sdc_eval.paths import add_out_root_arg, report_dir, resolve_root
+from sdc_eval.protocol import episode_months, parse_month
 from sdc_eval.policies import (HARLPolicy, NoOpPolicy, RandomPolicy, SB3Policy, expand_specs, make_policy,
                                obs_flags, split_label)
 from sdc_eval.decisions import DecisionRecorder, battery_summary, frame as decision_frame
@@ -175,7 +176,9 @@ def main():
     p.add_argument('--n_episodes', type=int, default=5)
     p.add_argument('--seed', type=int, default=FINAL_EVAL_SEED, help='Episode i uses seed + i.')
     p.add_argument('--location', default=None)
-    p.add_argument('--month', type=int, default=None)
+    p.add_argument('--month', type=parse_month, default=None,
+                   help='0..11 (0 = January), all (random start day over the year) or cycle (episode i in month '
+                        'i %% 12; sdc_eval/protocol.py). Default: the env yaml (6, July).')
     p.add_argument('--days_per_episode', type=int, default=None)
     p.add_argument('--pv_capacity_kWp', type=float, default=None,
                    help="Override the env config's on-site PV capacity (pv_config.capacity_kWp; 0 = no PV).")
@@ -185,6 +188,9 @@ def main():
     p.add_argument('--ci_year', type=int, default=None,
                    help='Year of the carbon intensity data (default: the env yaml, 2022). 2023: held-out test year '
                         '(locations ca and tx).')
+    p.add_argument('--workload_file', default=None,
+                   help='Workload trace in data/Workload (default: the env yaml, Alibaba_CPU_Data_Hourly_1.csv), e.g. '
+                        'Alibaba_CPU_Data_Hourly_2.csv as held-out test workload.')
     p.add_argument('--out_dir', default=None, help='Default: <out_root>/eval_compare/<timestamp>')
     p.add_argument('--save_decisions', action=argparse.BooleanOptionalAction, default=True,
                    help='Save every step\'s decisions (actions + context) to <out_dir>/decisions.csv.gz '
@@ -200,7 +206,7 @@ def main():
 
     with open(ENV_CFG) as f:
         scenario = yaml.safe_load(f)
-    for key in ['location', 'month', 'days_per_episode', 'ci_year']:
+    for key in ['location', 'month', 'days_per_episode', 'ci_year', 'workload_file']:
         if getattr(args, key) is not None:
             scenario[key] = getattr(args, key)
     if args.pv_capacity_kWp is not None:
@@ -208,6 +214,7 @@ def main():
     if args.include_pv is not None:
         scenario['include_pv'] = args.include_pv
     seeds = [args.seed + i for i in range(args.n_episodes)]
+    months = episode_months(scenario['month'], len(seeds))  # the env month of each episode (all equal unless cycle)
 
     policies = [make_policy(s) for s in expand_specs(args.policy)]
     for label, pol in policies:
@@ -217,17 +224,22 @@ def main():
         if diff:
             print(f"Note: '{label}' was trained on a different scenario (trained vs eval): {diff}")
 
-    print(f"Scenario: location={scenario['location']} month={scenario['month']} days={scenario['days_per_episode']} | "
+    print(f"Scenario: location={scenario['location']} month={scenario['month']} days={scenario['days_per_episode']} "
+          f"CI {scenario.get('ci_year') or 2022} workload {scenario.get('workload_file')} | "
           f"{len(seeds)} episodes, seeds {seeds[0]}..{seeds[-1]}")
     results, fingerprints, decision_frames = {}, {}, []
     for label, pol in policies:
         # Observation flags follow the policy; everything that shapes the episode comes from the scenario.
         # Controllers that read the simulator directly need no observation flags (default off).
         dc_sp, pv_obs = obs_flags(pol)
-        sdc = SustainDC({**scenario, 'agents': list(AGENTS), 'include_dc_setpoint': dc_sp, 'include_pv_obs': pv_obs})
+        envs = {}  # one simulator per episode month
         results[label], fingerprints[label] = [], []
         episode_rows = []
-        for seed in seeds:
+        for seed, month in zip(seeds, months):
+            if month not in envs:
+                envs[month] = SustainDC({**scenario, 'month': month, 'agents': list(AGENTS),
+                                         'include_dc_setpoint': dc_sp, 'include_pv_obs': pv_obs})
+            sdc = envs[month]
             rec = DecisionRecorder(sdc) if args.save_decisions else None
             m, fp = run_episode(sdc, pol, seed, trace=rec)
             results[label].append(m); fingerprints[label].append(fp)

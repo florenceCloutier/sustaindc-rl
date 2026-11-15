@@ -15,6 +15,7 @@
 #   EXTRA       extra train_mpc_value.py arguments for every run (they override the settings below)
 #   PV_KWP      on-site PV capacity in kWp (default 0: no PV). The learned value then has the PV context features
 #               and must be evaluated with the same PV settings (scripts/mpc/eval.sh with the same PV_KWP/INCLUDE_PV).
+#   MONTH       training month: 0..11, or all (episodes start anywhere in the year). Default: the env yaml's (6).
 #   INCLUDE_PV  1: PV actions, the MPC's battery planner picks among the 9 battery x PV actions (use / battery /
 #               resell); needs PV_KWP > 0. Unset: the automatic PV rule.
 #
@@ -23,7 +24,7 @@
 # No PV unless PV_KWP is set. A requeued job restarts the run from scratch (it is short).
 # Outputs: $SDC_RUNS/EXP_NAME/{jobs,slurm,runs}, manifest.tsv. Evaluate with scripts/mpc/eval.sh.
 set -euo pipefail
-if [ $# -ne 4 ]; then sed -n '2,22p' "$0"; exit 1; fi
+if [ $# -ne 4 ]; then sed -n '2,23p' "$0"; exit 1; fi
 EXP=$1; TIME=$2; LOCS=$3; SEEDS=$4
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -35,14 +36,14 @@ OUT=${SDC_RUNS:-$CODE/results/marl_runs}/$EXP
 CPUS=16
 
 PV_KWP=${PV_KWP:-0}
-MPC_ARGS="--iters 4 --episodes 32 --workers $CPUS --pv_capacity_kWp $PV_KWP"
+MPC_ARGS="--iters 4 --episodes 32 --workers $CPUS --pv_capacity_kWp $PV_KWP${MONTH:+ --month $MONTH}"
 if [ "${INCLUDE_PV:-0}" = 1 ]; then
   awk -v k="$PV_KWP" 'BEGIN { exit !(k > 0) }' || { echo "INCLUDE_PV=1 needs PV_KWP > 0"; exit 1; }
   MPC_ARGS="$MPC_ARGS --include_pv"
 fi
 
 mkdir -p "$OUT/jobs" "$OUT/slurm"
-echo "EXP $EXP | mpc | PV ${PV_KWP} kWp$([ "${INCLUDE_PV:-0}" = 1 ] && echo ', PV actions') | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
+echo "EXP $EXP | mpc | month ${MONTH:-yaml} | PV ${PV_KWP} kWp$([ "${INCLUDE_PV:-0}" = 1 ] && echo ', PV actions') | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for loc in $LOCS; do for seed in $SEEDS; do
   name=mpc_${loc}_s${seed}
   train_seed=$((3000 + 100 * (seed - 1)))

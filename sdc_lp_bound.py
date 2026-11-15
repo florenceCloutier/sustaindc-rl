@@ -337,12 +337,14 @@ def main():
     import yaml
     from scipy import stats
     from sdc_eval.constants import AGENTS, ENV_CFG, FINAL_EVAL_SEED
+    from sdc_eval.protocol import episode_months, parse_month
     from sdc_eval.rollout import reset_reward_history
     from sustaindc_env import SustainDC
 
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__)
     p.add_argument('--location', default=None)
-    p.add_argument('--month', type=int, default=None)
+    p.add_argument('--month', type=parse_month, default=None, help='0..11, all or cycle (as eval_compare.py).')
+    p.add_argument('--workload_file', default=None, help='Workload trace (default: the env yaml), as eval_compare.py.')
     p.add_argument('--days_per_episode', type=int, default=None)
     p.add_argument('--pv_capacity_kWp', type=float, default=0.0)
     p.add_argument('--ci_year', type=int, default=None,
@@ -354,18 +356,23 @@ def main():
 
     with open(ENV_CFG) as f:
         scenario = yaml.safe_load(f)
-    for key in ['location', 'month', 'days_per_episode', 'ci_year']:
+    for key in ['location', 'month', 'days_per_episode', 'ci_year', 'workload_file']:
         if getattr(args, key) is not None:
             scenario[key] = getattr(args, key)
     scenario['pv_config'] = {**scenario.get('pv_config', {}), 'capacity_kWp': args.pv_capacity_kWp}
     seeds = [args.seed + i for i in range(args.n_episodes)]
+    months = episode_months(scenario['month'], len(seeds))
     print(f"LP bound: location={scenario['location']} month={scenario['month']} days={scenario['days_per_episode']} | "
           f"{len(seeds)} episodes, seeds {seeds[0]}..{seeds[-1]}", flush=True)
-    sdc = SustainDC({**scenario, 'agents': list(AGENTS), 'include_dc_setpoint': False, 'include_pv_obs': False})
+    envs = {}  # one simulator per episode month (as eval_compare.py)
 
     rows = []
     energy = None
-    for seed in seeds:
+    for seed, month in zip(seeds, months):
+        if month not in envs:
+            envs[month] = SustainDC({**scenario, 'month': month, 'agents': list(AGENTS), 'include_dc_setpoint': False,
+                                     'include_pv_obs': False})
+        sdc = envs[month]
         random.seed(seed)
         np.random.seed(seed)
         reset_reward_history()
@@ -373,7 +380,7 @@ def main():
         energy = energy or EnergyModel(sdc)
         sol = build_and_solve(sdc, energy=energy)
         noop = sol['noop']['co2_work_adjusted']
-        rows.append({'seed': seed, 'noop_co2_work_adjusted': noop, 'noop_co2': sol['noop']['co2'],
+        rows.append({'seed': seed, 'month': month, 'noop_co2_work_adjusted': noop, 'noop_co2': sol['noop']['co2'],
                      'bound_co2_work_adjusted': sol['bound_kg'], 'bound_co2': sol['co2_kg'],
                      'bound_unexecuted_util_steps': sol['unexecuted_util_steps'],
                      'pct_vs_noop': 100 * (sol['bound_kg'] / noop - 1),

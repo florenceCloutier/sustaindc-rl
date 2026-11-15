@@ -10,6 +10,12 @@
 # Held-out test year (opt-in): CI_YEAR=2023 replays July 2023 carbon intensity (locations ca and tx) for policies
 #   trained on 2022; weather and workload are unchanged. Report it next to the 2022 results, not merged with them.
 #
+# Full year and held-out workload (opt-in, e.g. grid_v2: MONTH=cycle N_EPISODES=12 CI_YEAR=2023
+#   WORKLOAD_FILE=Alibaba_CPU_Data_Hourly_2.csv for policies trained with MONTH=all on 2022 / Alibaba_1):
+#   MONTH=<0..11|cycle>   episode month (default 6, July); cycle: episode i in month i % 12 (sdc_eval/protocol.py)
+#   N_EPISODES=<n>        episodes, seeds 1000..1000+n-1 (default 10)
+#   WORKLOAD_FILE=<file>  workload trace in data/Workload (default: the env yaml's, Alibaba_CPU_Data_Hourly_1.csv)
+#
 # PV scenario (opt-in; results are only comparable with runs of the same PV settings):
 #   PV_KWP=<kWp>     on-site PV capacity (default 0 = the protocol above, no PV)
 #   INCLUDE_PV=1     PV actions: the battery agent dispatches PV (use / battery / resell); needs PV_KWP > 0.
@@ -28,7 +34,7 @@
 #   python eval_compare.py --combine <out_dir_1> <out_dir_2> ... --out_dir <combined_dir>
 set -euo pipefail
 if [ $# -lt 3 ]; then
-    sed -n '2,21p' "$0"
+    sed -n '2,27p' "$0"
     exit 1
 fi
 LOC=$1; OUT=$2; shift 2
@@ -38,6 +44,9 @@ PV_KWP=${PV_KWP:-0}
 PV_ARGS=(--pv_capacity_kWp "$PV_KWP")
 CI_ARGS=()
 if [ -n "${CI_YEAR:-}" ]; then CI_ARGS=(--ci_year "$CI_YEAR"); fi
+if [ -n "${WORKLOAD_FILE:-}" ]; then CI_ARGS+=(--workload_file "$WORKLOAD_FILE"); fi
+MONTH=${MONTH:-6}; N_EPISODES=${N_EPISODES:-10}
+case $MONTH in all) echo "MONTH=all is for training; evaluate with a fixed month or MONTH=cycle"; exit 1 ;; esac
 if [ "${INCLUDE_PV:-0}" = 1 ]; then
     awk -v k="$PV_KWP" 'BEGIN { exit !(k > 0) }' || { echo "INCLUDE_PV=1 needs PV_KWP > 0"; exit 1; }
     PV_ARGS+=(--include_pv)
@@ -46,7 +55,7 @@ cd "$(dirname "$0")/.."
 POLICIES=(--policy noop)
 for spec in "$@"; do POLICIES+=(--policy "$spec"); done
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
-echo "eval_protocol: $LOC | CI ${CI_YEAR:-2022} | PV ${PV_KWP} kWp$([ "${INCLUDE_PV:-0}" = 1 ] && echo ', PV actions') | code $(git rev-parse --short HEAD 2>/dev/null || echo '?') | host $(hostname) | $(date)"
+echo "eval_protocol: $LOC | month $MONTH | $N_EPISODES episodes | CI ${CI_YEAR:-2022} | workload ${WORKLOAD_FILE:-yaml} | PV ${PV_KWP} kWp$([ "${INCLUDE_PV:-0}" = 1 ] && echo ', PV actions') | code $(git rev-parse --short HEAD 2>/dev/null || echo '?') | host $(hostname) | $(date)"
 python -u eval_compare.py "${POLICIES[@]}" \
-    --location "$LOC" --month 6 --days_per_episode 30 "${PV_ARGS[@]}" ${CI_ARGS[@]+"${CI_ARGS[@]}"} \
-    --n_episodes 10 --seed 1000 --out_dir "$OUT"
+    --location "$LOC" --month "$MONTH" --days_per_episode 30 "${PV_ARGS[@]}" ${CI_ARGS[@]+"${CI_ARGS[@]}"} \
+    --n_episodes "$N_EPISODES" --seed 1000 --out_dir "$OUT"

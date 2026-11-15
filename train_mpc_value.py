@@ -51,6 +51,7 @@ from sdc_eval.constants import ENV_CFG, MPC_TRAIN_SEED, STEP_HOURS, TRAIN_EVAL_S
 from sdc_eval.metrics import EpisodeAccumulator
 from sdc_eval.config import add_config_args, explicit_dests, resolve_hparams
 from sdc_eval.evaluator import FixedSeedEvaluator
+from sdc_eval.protocol import parse_month
 from sdc_eval.logger import RunLogger
 from sdc_eval.paths import resolve_root, run_dir as run_dir_for
 from sdc_eval.rollout import reset_reward_history
@@ -338,7 +339,8 @@ def fit_per_unit(episodes, ci_scale, val_episodes, log):
 def main():
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__)
     p.add_argument('--location', required=True)
-    p.add_argument('--month', type=int, default=None, help='Default: the env config month (6, July).')
+    p.add_argument('--month', type=parse_month, default=None,
+                   help='Default: the env config month (6, July). all: episodes start anywhere in the year.')
     p.add_argument('--days_per_episode', type=int, default=30)
     p.add_argument('--pv_capacity_kWp', type=float, default=None,
                    help="On-site PV capacity (pv_config.capacity_kWp; 0 = no PV). Default: the env yaml.")
