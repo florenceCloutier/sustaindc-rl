@@ -1,5 +1,6 @@
 #!/bin/bash
-# Submit the joint-MPC (mpc_policy.py, CEM on a simulator clone) search / horizon sweep to Slurm: one job per
+# Submit the joint-MPC (mpc_policy.py, CEM on a simulator clone; or MPPI, mppi_policy.py, with KIND=mppi) search /
+# horizon sweep to Slurm: one job per
 # location x config x forecast x CEM seed, each scored on the shared protocol (scripts/eval_protocol.sh: noop + the
 # policy; by default seeds 1000..1009, 30 days, July, PV off, see Scenario below), so every result goes into the same paired table as the other
 # methods (merge folders with eval_compare.py --combine).
@@ -20,6 +21,9 @@
 #   H96S_metric  H96S planning on the evaluation metric: end_cost=metric, drop_w=0, overdue_w=0 (mpc_policy.py doc)
 #                                                                                       ~20 h (TIME 48:00:00)
 # FORECASTS: oracle (true future) and/or persistence (past data only).
+# KIND=mppi: the same configs with MPPI (mppi_policy.py) instead of CEM, on the same planning model and cost; labels
+#   start with mppi_ instead of mpc_joint_. EXTRA: more policy parameters appended to every config (e.g.
+#   EXTRA=sampling=categorical,temperature=0.3); give them a TAG, added to the labels (..._<cfg>_<TAG>_s<k>).
 # SEEDS: CEM seeds k = 1, 2, ... (mpc_joint seed=k-1, as the grid_v1 persist runs); runs are labelled
 #   mpc_joint_<forecast>_<config>_s<k> and pooled per method in the paired table.
 #
@@ -35,7 +39,7 @@
 #                scenario), to choose a config without looking at the protocol episodes. Labels get a _sel suffix.
 # Outputs: $SDC_RUNS/EXP_NAME/{jobs,slurm}, $SDC_RUNS/EXP_NAME/eval/LOCATION/<label>, manifest.tsv.
 set -euo pipefail
-if [ $# -ne 5 ]; then sed -n '2,38p' "$0"; exit 1; fi
+if [ $# -ne 5 ]; then sed -n '2,40p' "$0"; exit 1; fi
 EXP=$1; LOCS=$2; CONFIGS=$3; FORECASTS=$4; SEEDS=$5
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -46,6 +50,9 @@ PY=$(command -v "$PY")
 OUT=${SDC_RUNS:-$CODE/results/marl_runs}/$EXP
 CPUS=17  # 16 rollout workers + the episode process
 MODE=${MODE:-protocol}
+KIND=${KIND:-mpc_joint}
+case $KIND in mpc_joint|mppi) ;; *) echo "KIND must be mpc_joint or mppi (got $KIND)"; exit 1 ;; esac
+if [ -n "${EXTRA:-}" ] && [ -z "${TAG:-}" ]; then echo "EXTRA needs a TAG (label suffix)"; exit 1; fi
 case $MODE in protocol|select) ;; *) echo "MODE must be protocol or select (got $MODE)"; exit 1 ;; esac
 
 config_params() {
@@ -75,17 +82,17 @@ SCEN_ENV="PV_KWP=$PV_KWP INCLUDE_PV=$INCLUDE_PV MONTH=$MONTH N_EPISODES=$N_EPISO
 # Select mode: the same scenario on the tuning seeds (one episode per month with cycle).
 SEL_N=5; if [ "$MONTH" = cycle ]; then SEL_N=12; fi
 SEL_ARGS="--month $MONTH --pv_capacity_kWp $PV_KWP$([ "$INCLUDE_PV" = 1 ] && echo ' --include_pv' || true)${CI_YEAR:+ --ci_year $CI_YEAR}${WORKLOAD_FILE:+ --workload_file $WORKLOAD_FILE}"
-echo "EXP $EXP | mpc_joint sweep ($MODE) | $SCEN_ENV | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
+echo "EXP $EXP | $KIND sweep ($MODE) | $SCEN_ENV | code $CODE @ $(git -C "$CODE" rev-parse --short HEAD 2>/dev/null || echo '?') | python $PY | out $OUT"
 for loc in $LOCS; do
   case $loc in az|ny|tx|ca) ;; *) echo "LOCATION must be az, ny, tx or ca (got $loc)"; exit 1 ;; esac
   for cfg in $CONFIGS; do
-    params=$(config_params "$cfg")
+    params=$(config_params "$cfg")${EXTRA:+,$EXTRA}
     for fc in $FORECASTS; do
       case $fc in oracle|persistence) ;; *) echo "FORECAST must be oracle or persistence (got $fc)"; exit 1 ;; esac
       for k in $SEEDS; do
-        label=mpc_joint_${fc}_${cfg}_s$k
-        [ "$MODE" = select ] && label=mpc_joint_${fc}_${cfg}_sel_s$k
-        spec="mpc_joint:$params,forecast=$fc,workers=16,seed=$((k - 1))=$label"
+        label=${KIND}_${fc}_${cfg}${TAG:+_$TAG}_s$k
+        [ "$MODE" = select ] && label=${KIND}_${fc}_${cfg}${TAG:+_$TAG}_sel_s$k
+        spec="$KIND:$params,forecast=$fc,workers=16,seed=$((k - 1))=$label"
         name=${label}_$loc
         eval_dir="$OUT/eval/$loc/$label"
         if [ "$MODE" = protocol ]; then
@@ -108,7 +115,7 @@ JOB
         # shellcheck disable=SC2086
         jid=$(sbatch --parsable -J "sdc-$EXP-$name" --cpus-per-task=$CPUS --mem=32G --time=${TIME:-$(config_time "$cfg")} \
               --requeue ${SBATCH_ARGS:-} -o "$OUT/slurm/$name.log" "$OUT/jobs/$name.sh")
-        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$jid" "mpc_joint" "$loc" "$label" "$spec" "$(date -Is)" >> "$OUT/manifest.tsv"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$jid" "$KIND" "$loc" "$label" "$spec" "$(date -Is)" >> "$OUT/manifest.tsv"
         echo "$jid $name"
       done
     done

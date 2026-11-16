@@ -210,7 +210,7 @@ class HARLPolicy:
 
 
 # ':'-separated segment holding key=value parameters
-PARAM_SEGMENT = {'rule': 2, 'oracle': 2, 'mpc': 1, 'mpc_joint': 1, 'lp_replay': 1}
+PARAM_SEGMENT = {'rule': 2, 'oracle': 2, 'mpc': 1, 'mpc_joint': 1, 'mppi': 1, 'lp_replay': 1}
 
 
 def split_label(spec):
@@ -250,6 +250,9 @@ def make_policy(spec):
     elif kind == 'mpc_joint':
         from mpc_policy import make_mpc_policy as make_joint_mpc_policy
         policy = make_joint_mpc_policy(rest)
+    elif kind == 'mppi':
+        from mppi_policy import make_mppi_policy
+        policy = make_mppi_policy(rest)
     elif kind == 'lp_replay':
         from sdc_lp_bound import make_lp_policy
         policy = make_lp_policy(rest)
