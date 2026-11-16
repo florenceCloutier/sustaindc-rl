@@ -22,7 +22,8 @@
 #                                                                                       ~20 h (TIME 48:00:00)
 # FORECASTS: oracle (true future) and/or persistence (past data only).
 # KIND=mppi: the same configs with MPPI (mppi_policy.py) instead of CEM, on the same planning model and cost; labels
-#   start with mppi_ instead of mpc_joint_. EXTRA: more policy parameters appended to every config (e.g.
+#   start with mppi_ instead of mpc_joint_. Faster: scripts/mpc/mppi_launch.sh (same configs and labels, one Slurm job
+#   per episode). EXTRA: more policy parameters appended to every config (e.g.
 #   EXTRA=sampling=categorical,temperature=0.3); give them a TAG, added to the labels (..._<cfg>_<TAG>_s<k>).
 # SEEDS: CEM seeds k = 1, 2, ... (mpc_joint seed=k-1, as the grid_v1 persist runs); runs are labelled
 #   mpc_joint_<forecast>_<config>_s<k> and pooled per method in the paired table.
@@ -39,7 +40,7 @@
 #                scenario), to choose a config without looking at the protocol episodes. Labels get a _sel suffix.
 # Outputs: $SDC_RUNS/EXP_NAME/{jobs,slurm}, $SDC_RUNS/EXP_NAME/eval/LOCATION/<label>, manifest.tsv.
 set -euo pipefail
-if [ $# -ne 5 ]; then sed -n '2,40p' "$0"; exit 1; fi
+if [ $# -ne 5 ]; then sed -n '2,41p' "$0"; exit 1; fi
 EXP=$1; LOCS=$2; CONFIGS=$3; FORECASTS=$4; SEEDS=$5
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -55,22 +56,8 @@ case $KIND in mpc_joint|mppi) ;; *) echo "KIND must be mpc_joint or mppi (got $K
 if [ -n "${EXTRA:-}" ] && [ -z "${TAG:-}" ]; then echo "EXTRA needs a TAG (label suffix)"; exit 1; fi
 case $MODE in protocol|select) ;; *) echo "MODE must be protocol or select (got $MODE)"; exit 1 ;; esac
 
-config_params() {
-  case $1 in
-    H48)         echo "horizon=48,block=4" ;;
-    H96)         echo "horizon=96,block=8,replan=4" ;;
-    H192)        echo "horizon=192,block=16,replan=4" ;;
-    S)           echo "horizon=48,block=4,samples=128,iters=5" ;;
-    H96S)        echo "horizon=96,block=8,replan=4,samples=128,iters=5" ;;
-    H96S_metric) echo "horizon=96,block=8,replan=4,samples=128,iters=5,end_cost=metric,drop_w=0,overdue_w=0" ;;
-    *) echo "Unknown config $1 (valid: H48 H96 H192 S H96S H96S_metric)" >&2; exit 1 ;;
-  esac
-}
-config_time() {
-  case $1 in
-    H48) echo 08:00:00 ;; H96) echo 12:00:00 ;; H192|S) echo 24:00:00 ;; H96S|H96S_metric) echo 48:00:00 ;;
-  esac
-}
+# shellcheck source=configs.sh
+source "$SCRIPT_DIR/configs.sh"
 
 mkdir -p "$OUT/jobs" "$OUT/slurm"
 PV_KWP=${PV_KWP:-0}; INCLUDE_PV=${INCLUDE_PV:-0}; MONTH=${MONTH:-6}; N_EPISODES=${N_EPISODES:-10}
@@ -86,7 +73,7 @@ echo "EXP $EXP | $KIND sweep ($MODE) | $SCEN_ENV | code $CODE @ $(git -C "$CODE"
 for loc in $LOCS; do
   case $loc in az|ny|tx|ca) ;; *) echo "LOCATION must be az, ny, tx or ca (got $loc)"; exit 1 ;; esac
   for cfg in $CONFIGS; do
-    params=$(config_params "$cfg")${EXTRA:+,$EXTRA}
+    params=$(config_params "$cfg")${EXTRA:+,$EXTRA} || exit 1
     for fc in $FORECASTS; do
       case $fc in oracle|persistence) ;; *) echo "FORECAST must be oracle or persistence (got $fc)"; exit 1 ;; esac
       for k in $SEEDS; do
