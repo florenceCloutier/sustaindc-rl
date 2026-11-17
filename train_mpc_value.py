@@ -372,8 +372,8 @@ def main():
     p.add_argument('--eval_days', type=int, default=None, help='Days per evaluation episode (default: days_per_episode).')
     p.add_argument('--save_decisions', action=argparse.BooleanOptionalAction, default=True,
                    help='Save the per-step decisions of every evaluation to <run>/eval/decisions/.')
-    p.add_argument('--drop_tolerance', type=float, default=1.0,
-                   help='Best-model guard: max mean tasks dropped per eval episode above noop.')
+    p.add_argument('--drop_tolerance', type=float, default=None,
+                   help='Optional best-model guard: max mean tasks dropped per eval episode above noop (default: none).')
     args = p.parse_args()
 
     # Hyperparameters: defaults < --config < explicit flags < --set (sdc_eval/config.py)

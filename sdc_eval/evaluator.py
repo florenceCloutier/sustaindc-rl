@@ -4,8 +4,11 @@ Each evaluation runs the current policy on the same fixed episodes (TRAIN_EVAL_S
 FINAL_EVAL_SEED episodes used for reporting), with the same rollout and metrics as eval_compare.py. The do-nothing
 policy is evaluated once on the same episodes, so every evaluation also reports the paired % change vs noop.
 
-Best model: lowest mean co2_work_adjusted (CO2 with unexecuted work charged at its marginal energy), among the
-evaluations whose mean dropped tasks per episode stay within `drop_tolerance` of noop's. The framework passes a
+Best model: lowest mean co2_work_adjusted (CO2 with unexecuted work charged at its marginal energy). By default
+every evaluation is eligible: "dropped" tasks (deferred into a full queue) run in the same step in envs/carbon_ls.py,
+so they are not lost work, and work that never runs is already charged by co2_work_adjusted. With a `drop_tolerance`
+only evaluations whose mean dropped tasks per episode stay within it of noop's are eligible (the old guard: with
+noop dropping none, it kept early checkpoints of policies that drop a few tasks). The framework passes a
 save_fn(tag) that writes its own checkpoint format; it is called with 'best' when an evaluation sets a new best.
 
 Writes <run>/eval/evals.csv (one row per evaluation, every metric's mean) and <run>/eval/best_eval.json.
@@ -40,12 +43,13 @@ def run_spec_episode(job):
 
 
 class FixedSeedEvaluator:
-    def __init__(self, scenario, run_dir, logger=None, n_episodes=5, seed=TRAIN_EVAL_SEED, drop_tolerance=1.0,
+    def __init__(self, scenario, run_dir, logger=None, n_episodes=5, seed=TRAIN_EVAL_SEED, drop_tolerance=None,
                  days_per_episode=None, save_decisions=True):
         """
         scenario: the training env config (dict). Observation flags are taken from each evaluated policy.
         days_per_episode: optionally shorten evaluation episodes (default: the training scenario's).
-        drop_tolerance: max increase over noop of the mean tasks dropped per episode for a model to be selectable.
+        drop_tolerance: None (default): every evaluation is selectable. A number: max increase over noop of the mean
+            tasks dropped per episode for a model to be selectable.
         save_decisions: write every evaluation's per-step decisions to <run>/eval/decisions/<env_steps>.csv.gz
             (sdc_eval.decisions) and the best one's to <run>/eval/decisions_best.csv.gz.
         """
@@ -114,8 +118,11 @@ class FixedSeedEvaluator:
         for k in (SELECTION_METRIC, 'co2', 'total_energy', 'tasks_dropped'):
             out[f'{k}_std'] = agg[k][1]
 
-        noop_dropped = float(np.mean([e['tasks_dropped'] for e in self.noop]))
-        eligible = means['tasks_dropped'] <= noop_dropped + self.drop_tolerance
+        if self.drop_tolerance is None:
+            eligible = True
+        else:
+            noop_dropped = float(np.mean([e['tasks_dropped'] for e in self.noop]))
+            eligible = means['tasks_dropped'] <= noop_dropped + self.drop_tolerance
         is_best = eligible and (self.best is None or means[SELECTION_METRIC] < self.best['metrics'][SELECTION_METRIC])
         out['eligible'] = float(eligible)
         if is_best:
@@ -128,9 +135,10 @@ class FixedSeedEvaluator:
                 shutil.copy(decisions_path, os.path.join(self.dir, 'decisions_best.csv.gz'))
             if save_fn is not None:
                 save_fn('best')
-        if self.best is not None:
-            out[f'best_{SELECTION_METRIC}'] = self.best['metrics'][SELECTION_METRIC]
-            out[f'best_{SELECTION_METRIC}_pct_vs_noop'] = self.best['metrics'][f'{SELECTION_METRIC}_pct_vs_noop']
+        # Always written (NaN before a first best), so every row of evals.csv has the header's columns.
+        best = self.best['metrics'] if self.best is not None else {}
+        out[f'best_{SELECTION_METRIC}'] = best.get(SELECTION_METRIC, float('nan'))
+        out[f'best_{SELECTION_METRIC}_pct_vs_noop'] = best.get(f'{SELECTION_METRIC}_pct_vs_noop', float('nan'))
 
         if self.logger is not None:
             self.logger.scalars('eval', out, env_steps)

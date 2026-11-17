@@ -27,7 +27,7 @@ EVAL_DEFAULTS = {
     'eval_every_steps': EVAL_EVERY_STEPS,  # common fixed-seed evaluation every N env steps (all threads)
     'n_eval_episodes': 5,                  # episodes per evaluation, seeds TRAIN_EVAL_SEED + i
     'eval_days': None,                     # days per evaluation episode (None: the training days_per_episode)
-    'drop_tolerance': 1.0,                 # best-model guard: max mean tasks dropped per episode above noop
+    'drop_tolerance': None,                # optional best-model guard (None: lowest co2_work_adjusted, no drop limit)
     'legacy_eval': False,                  # also run HARL's original (not fixed-seed) evaluation
     'save_decisions': True,                # per-step decisions of every evaluation -> eval/decisions/
 }

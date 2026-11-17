@@ -211,8 +211,9 @@ def main():
                    help='Days per evaluation episode (default: the training days_per_episode).')
     p.add_argument('--save_decisions', action=argparse.BooleanOptionalAction, default=True,
                    help='Save the per-step decisions of every evaluation to <run>/eval/decisions/.')
-    p.add_argument('--drop_tolerance', type=float, default=1.0,
-                   help='Best-model guard: max increase over noop of the mean tasks dropped per eval episode.')
+    p.add_argument('--drop_tolerance', type=float, default=None,
+                   help='Optional best-model guard: max increase over noop of the mean tasks dropped per eval episode '
+                        '(default: none, the best model is the lowest co2_work_adjusted).')
     p.add_argument('--checkpoint_freq', type=int, default=250_000, help='Save a checkpoint every N total env steps.')
     p.add_argument('--out_root', '--results_root', dest='out_root', default=None,
                    help='Top-level folder for runs: <root>/sustaindc/<location>/single_<algo>/<exp_name>/<run>. '
