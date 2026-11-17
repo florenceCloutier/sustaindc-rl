@@ -9,8 +9,11 @@
 # SDC_RUNS: as for scripts/mpc/launch.sh. Results go to $SDC_RUNS/EXP_NAME/eval/LOCATION/mpc.
 # PV_KWP / INCLUDE_PV: set them as for the training runs (see scripts/eval_protocol.sh); a value trained with PV
 # refuses a scenario without PV.
+# MODEL=final: evaluate the last policy-iteration round's value (value_iter<N>.npz, highest N) instead of the selected
+#   best one (value.npz); labels and the output folder get a _final suffix.
 set -euo pipefail
-if [ $# -ne 2 ]; then sed -n '2,9p' "$0"; exit 1; fi
+if [ $# -ne 2 ]; then sed -n '2,13p' "$0"; exit 1; fi
+case ${MODEL:-best} in best) SFX='' ;; final) SFX=_final ;; *) echo "MODEL must be best or final"; exit 1 ;; esac
 EXP=$1; LOC=$2
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 RUNS=$(cd "${SDC_RUNS:-$REPO/results/marl_runs}" && pwd)
@@ -20,13 +23,16 @@ SPECS=()
 for d in "${DIRS[@]}"; do
   name=${d##*/}; seed=${name#seed-}; seed=$((10#${seed%%-*}))
   k=$(( (seed - 3000) / 100 + 1 ))
-  if [ -f "$d/value.npz" ]; then
+  if [ -n "$SFX" ]; then
+    value=$(ls "$d"/value_iter*.npz 2>/dev/null | sort -V | tail -1)
+    [ -n "$value" ] || { echo "$name has no value_iter*.npz"; exit 1; }
+  elif [ -f "$d/value.npz" ]; then
     value=$d/value.npz
   else
     echo "Note: $name has no value.npz (the naive value was best); evaluating it with value=naive"
     value=naive
   fi
-  SPECS+=("mpc:H=16,forecast=realistic,value=$value=mpc_${EXP}_s$k")
+  SPECS+=("mpc:H=16,forecast=realistic,value=$value=mpc${SFX}_${EXP}_s$k")
 done
 echo "${#DIRS[@]} run(s): ${DIRS[*]##*/}"
-exec "$REPO/scripts/eval_protocol.sh" "$LOC" "$RUNS/$EXP/eval/$LOC/mpc" "${SPECS[@]}"
+exec "$REPO/scripts/eval_protocol.sh" "$LOC" "$RUNS/$EXP/eval/$LOC/mpc$SFX" "${SPECS[@]}"

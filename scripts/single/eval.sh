@@ -6,10 +6,13 @@
 # Usage:  scripts/single/eval.sh EXP_NAME LOCATION
 #   Slurm: sbatch -c 8 --mem 16G -t 04:00:00 scripts/single/eval.sh grid_v1 az
 # PV_KWP / INCLUDE_PV: set them as for the training runs (see scripts/eval_protocol.sh).
+# MODEL=final: evaluate the model at the end of training instead of the selected best one (final_model); labels and
+#   the output folder get a _final suffix.
 # SDC_RUNS: as for scripts/single/launch.sh. Results go to $SDC_RUNS/EXP_NAME/eval/LOCATION/single_ppo; merge with
 # the other methods' folders: python eval_compare.py --combine <dirs> --out_dir <dir>
 set -euo pipefail
-if [ $# -ne 2 ]; then sed -n '2,9p' "$0"; exit 1; fi
+if [ $# -ne 2 ]; then sed -n '2,11p' "$0"; exit 1; fi
+case ${MODEL:-best} in best) SFX=''; SB3=best_model ;; final) SFX=_final; SB3=final_model ;; *) echo "MODEL must be best or final"; exit 1 ;; esac
 EXP=$1; LOC=$2
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 RUNS=$(cd "${SDC_RUNS:-$REPO/results/marl_runs}" && pwd)
@@ -18,7 +21,7 @@ DIRS=("$RUNS/$EXP"/runs/sustaindc/"$LOC"/single_ppo/"$EXP"/seed-*)
 SPECS=()
 for d in "${DIRS[@]}"; do
   name=${d##*/}; seed=${name#seed-}; seed=$((10#${seed%%-*}))
-  SPECS+=("sb3:$d=ppo_${EXP}_s$seed")
+  SPECS+=("sb3:$d:$SB3=ppo${SFX}_${EXP}_s$seed")
 done
 echo "${#DIRS[@]} run(s): ${DIRS[*]##*/}"
-exec "$REPO/scripts/eval_protocol.sh" "$LOC" "$RUNS/$EXP/eval/$LOC/single_ppo" "${SPECS[@]}"
+exec "$REPO/scripts/eval_protocol.sh" "$LOC" "$RUNS/$EXP/eval/$LOC/single_ppo$SFX" "${SPECS[@]}"

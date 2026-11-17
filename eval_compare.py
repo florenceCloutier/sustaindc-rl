@@ -18,8 +18,9 @@ Policy specs:
     noop                          do nothing (ls: no shifting, dc: hold setpoint, bat: idle)
     random                        uniformly random actions (seeded per episode)
     sb3:<run_dir>[:<model>]       a train_single_agent.py run; <model> defaults to best_model
-    harl:<run_dir>                a HARL run directory containing config.json and models/actor_agent*.pt;
-                                  a glob (quote it) expands to one policy per run, labelled <label>_s<seed>
+    harl:<run_dir>[:final]        a HARL run directory containing config.json and models/actor_agent*.pt (the best
+                                  model; :final = models_final/, the end of training); a glob (quote it) expands
+                                  to one policy per run, labelled <label>_s<seed>
     rule:<subsystems>[:<params>]  rule-based controllers (past CI only), e.g. rule:ls,dc,bat or rule:bat:bat_lo=0.2
     oracle:<subsystems>[:<params>] perfect-forecast controllers (true future CI/workload/weather), e.g. oracle:ls,dc,bat
     mpc[:<params>]                MPC with a terminal value, e.g. mpc:H=16,value=<value.npz>,forecast=realistic

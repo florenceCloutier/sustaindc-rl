@@ -105,7 +105,11 @@ class HARLPolicy:
     ON_POLICY = ('happo', 'mappo', 'haa2c', 'hatrpo')
     OFF_POLICY = ('hasac', 'had3qn')
 
-    def __init__(self, run_dir):
+    def __init__(self, run_dir, which='best'):
+        """which: 'best' (models/, the selected best model; models_final/ if there is none) or 'final'
+        (models_final/, the model at the end of training)."""
+        if which not in ('best', 'final'):
+            raise ValueError(f"HARL model must be best or final, got {which!r}")
         from gymnasium import spaces
         from harl.algorithms.actors import ALGO_REGISTRY
         with open(os.path.join(run_dir, 'config.json')) as f:
@@ -132,8 +136,10 @@ class HARLPolicy:
         self._set_action_sizes()
         act_space = spaces.Discrete(self.pad_actions)
 
-        models_dir = 'models'
-        if not os.path.exists(os.path.join(run_dir, 'models', 'actor_agent0.pt')) and \
+        models_dir = 'models_final' if which == 'final' else 'models'
+        if which == 'final' and not os.path.exists(os.path.join(run_dir, 'models_final', 'actor_agent0.pt')):
+            raise FileNotFoundError(f'{run_dir} has no models_final/ (training did not finish)')
+        if which == 'best' and not os.path.exists(os.path.join(run_dir, 'models', 'actor_agent0.pt')) and \
                 os.path.exists(os.path.join(run_dir, 'models_final', 'actor_agent0.pt')):
             # No evaluation passed the best-model guard (see eval/evals.csv): use the final model.
             print(f'Note: {run_dir} has no best model in models/; using models_final/.')
@@ -240,7 +246,8 @@ def make_policy(spec):
         run_dir, _, model = rest.partition(':')
         policy = SB3Policy(run_dir, model or 'best_model')
     elif kind == 'harl':
-        policy = HARLPolicy(rest)
+        run_dir, _, which = rest.partition(':')
+        policy = HARLPolicy(run_dir, which or 'best')
     elif kind in ('rule', 'oracle', 'setpoint'):
         from baseline_policies import make_baseline_policy
         policy = make_baseline_policy(kind, rest)
@@ -267,15 +274,16 @@ def expand_specs(specs):
     for spec in specs:
         body, label = split_label(spec)
         kind, _, rest = body.partition(':')
-        if kind == 'harl' and any(ch in rest for ch in '*?['):
-            dirs = sorted(d for d in glob.glob(rest) if os.path.isfile(os.path.join(d, 'config.json')))
+        pattern, _, which = rest.partition(':')
+        if kind == 'harl' and any(ch in pattern for ch in '*?['):
+            dirs = sorted(d for d in glob.glob(pattern) if os.path.isfile(os.path.join(d, 'config.json')))
             if not dirs:
                 raise ValueError(f'No HARL run directories match {rest!r}')
             base = label or os.path.basename(os.path.dirname(dirs[0]))
             for d in dirs:
                 with open(os.path.join(d, 'config.json')) as f:
                     seed = json.load(f)['algo_args']['seed']['seed']
-                out.append(f'harl:{d}={base}_s{seed}')
+                out.append(f'harl:{d}' + (f':{which}' if which else '') + f'={base}_s{seed}')
         else:
             out.append(spec)
     return out
