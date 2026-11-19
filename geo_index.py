@@ -93,14 +93,31 @@ class SiteLP:
         # representative bundle(s) (a fraction phi of each must start)
         bundles = [] if bundle is None else [bundle] if isinstance(bundle, dict) else list(bundle)
         for bid, bun in enumerate(bundles):
-            if not len(bun['jobs']):
+            # jobs of the episode (indices), or forecast jobs given by their power and duration (geo_arrivals.py)
+            if 'jobs' in bun:
+                bj = np.asarray(bun['jobs'])
+                b_size, b_dur = size_i[bj], geo.dur[bj]
+            else:
+                b_dur = np.asarray(bun['dur'], float)
+                bj = np.zeros(0, dtype=np.int64)
+                b_size = np.asarray(bun['power_w'], float) / geo.cap_w[i]
+            if not len(b_dur):
                 continue
-            bj = bun['jobs']
             slack = np.floor(bun['slack']).astype(int)
-            for L in np.unique(slack):
-                jobs = bj[slack == L]
-                u, o = _profiles(size_i[jobs], geo.dur[jobs], span)
-                self.classes.append({'jobs': jobs, 'last': int(L), 'util': u, 'occ': o, 'kind': 'bundle', 'bid': bid})
+            if 'release' not in bun:
+                for L in np.unique(slack):
+                    m = slack == L
+                    u, o = _profiles(b_size[m], b_dur[m], span)
+                    self.classes.append({'jobs': bj[m] if len(bj) else bj, 'last': int(L), 'util': u, 'occ': o,
+                                         'kind': 'bundle', 'bid': bid})
+                continue
+            # known or forecast future arrivals: a job released r steps from now starts in [r, r + slack]
+            rel = np.maximum(np.round(bun['release']).astype(int), 0)
+            for r, L in sorted(set(zip(rel.tolist(), slack.tolist()))):
+                m = (rel == r) & (slack == L)
+                u, o = _profiles(b_size[m], b_dur[m], span)
+                self.classes.append({'jobs': bj[m] if len(bj) else bj, 'last': int(r + L), 'first': int(r),
+                                     'util': u, 'occ': o, 'kind': 'bundle', 'bid': bid})
 
         self.ci = np.asarray(ci[t:t + W], dtype=float)
         l_slope, l_icpt = lines[0][t:t + W], lines[1][t:t + W]
@@ -114,6 +131,9 @@ class SiteLP:
         xc, xs, xlate = [], [], []
         for c, cl in enumerate(self.classes):
             slots = _start_slots(max(cl['last'], 0) + late_steps, H)
+            first = cl.get('first', 0)
+            if first > 0:                       # not before its release; the release step itself is allowed
+                slots = np.unique(np.r_[slots[slots >= first], min(first, H - 1)])
             xc.append(np.full(len(slots), c))
             xs.append(slots)
             xlate.append(np.maximum(slots - max(cl['last'], 0), 0) * (slots > cl['last']))

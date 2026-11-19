@@ -5,9 +5,20 @@ Methods (all on the same episode: same jobs, CI and weather for a given seed):
     origin, greedy_ci, merit   JobRouter (geo_job_baselines.py), earliest-deadline-first starts, no battery / cooling
     index                      IndexPolicy: every site uses its nominal CI forecast (the truth when --sigma24 0)
     screen                     ScreenedIndexPolicy: nominal + box everywhere, refined forecast on boundary sites only
+    screen_lin                 screen with exact linear index intervals (sufficiency/screen.py, interval='linear')
+    screen_meas                screen_lin, but boundary segments send one projected difference each instead of the
+                               site's whole refined forecast (refine='measure'; sites failing the linearity guard
+                               still get the whole forecast)
     index_full                 every site uses the refined forecast and the fine curve (full information)
     mpc                        B1, JointMPCPolicy (nominal forecasts); --time_limit caps each hourly joint LP
     mpc_full                   B1 with the refined forecasts
+    dual                       price-coordinated routing (geo_dual.py): Dantzig-Wolfe on B1's joint LP, each site
+                               solving only its own LP; reaches B1's optimum
+    dual_w<warm>[_r<k>]        dual warm-started (warm = last: the previous hour's prices; index: the index policy's
+                               clearing prices; both), at most k rounds (dual_r<k>: cold, at most k rounds)
+    dual_screen                dual + screening (sufficiency/dual_screen.py): refined forecasts only for the sites
+                               whose answer to the prices changes within their forecast box
+    dual_full                  dual with refined forecasts at every site (full information)
     ppo:<run_dir>              B3, a router trained by train_geo_job_ppo.py (best checkpoint of the run)
 and, with --bound, the hindsight LP bound (geo_lp_oracle geo_time, battery + cooling envelope) for "captured":
     captured(m) = (origin - m) / (origin - bound)
@@ -23,6 +34,7 @@ import glob
 import json
 import os
 import random
+import re
 import sys
 import time
 import warnings
@@ -48,14 +60,30 @@ def make_method(name, args):
     fc = {'sigma24': args.sigma24, 'rho': args.rho, 'fc_seed': args.seed}
     if name in JOB_ROUTERS:
         return 'router', JobRouter(name)
-    if name in ('index', 'screen', 'index_full'):
+    if name in ('index', 'screen', 'index_full', 'screen_lin', 'screen_meas'):
         from sufficiency.screen import ScreenedIndexPolicy
-        mode = {'index': 'nominal', 'screen': 'screen', 'index_full': 'refine_all'}[name]
-        return 'policy', ScreenedIndexPolicy(mode=mode, levels_fine=args.levels_fine, n_samples=args.n_samples, **fc, **kw)
+        mode = {'index': 'nominal', 'index_full': 'refine_all'}.get(name, 'screen')
+        extra = {'screen_lin': {'interval': 'linear'},
+                 'screen_meas': {'interval': 'linear', 'refine': 'measure'}}.get(name, {})
+        return 'policy', ScreenedIndexPolicy(mode=mode, levels_fine=args.levels_fine, n_samples=args.n_samples, **fc, **kw,
+                                             **extra)
     if name in ('mpc', 'mpc_full'):
         from geo_mpc import JointMPCPolicy
         return 'policy', JointMPCPolicy(time_limit=args.time_limit, forecast='refined' if name == 'mpc_full' else 'nominal',
                                         **fc, **kw)
+    if name == 'dual_fc':
+        from geo_dual_fc import DualForecastPolicy
+        return 'policy', DualForecastPolicy(time_limit=args.time_limit, **fc, **kw)
+    if name in ('dual_screen', 'dual_full'):
+        from sufficiency.dual_screen import DualScreenPolicy
+        return 'policy', DualScreenPolicy(mode=name.split('_')[1], time_limit=args.time_limit, **fc, **kw)
+    m = re.fullmatch(r'dual(?:_w(last|index|both))?(?:_r(\d+))?', name)
+    if m:
+        from geo_dual import DualPolicy
+        extra = {'warm': m.group(1) or 'none'}
+        if m.group(2):
+            extra['max_rounds'] = int(m.group(2))
+        return 'policy', DualPolicy(time_limit=args.time_limit, **fc, **kw, **extra)
     if name.startswith('ppo:'):
         from geo_rl_jobs import PPORouter
         return 'router', PPORouter.load(name[4:], sigma24=args.sigma24, rho=args.rho, fc_seed=args.seed)
@@ -75,6 +103,19 @@ def run_method(geo, name, args):
     else:
         out = run_index_episode(geo, m, args.seed)
         out.update(screen_summary(m))
+        from sufficiency.dual_screen import dscreen_summary
+        out.update(dscreen_summary(m))
+        if m.stats.get('dw_rounds'):
+            st = m.stats
+            out.update({'dw_rounds_mean': float(np.mean(st['dw_rounds'])), 'dw_rounds_max': int(np.max(st['dw_rounds'])),
+                        'dw_gap_max': float(np.max(st['dw_gap'])), 'dw_unrouted_max': float(np.max(st['dw_unrouted'])),
+                        'dw_parallel_s_mean': float(np.mean(st['dw_site_s'])) + float(np.mean(st['dw_master_s'])),
+                        'dw_total_s_mean': float(np.mean(st['dw_total_s']))})
+            if st.get('dw_site_lps'):
+                out.update({'dw_site_lps_per_hour': float(np.mean(st['dw_site_lps'])),
+                            'dw_warm_s_mean': float(np.mean(st['dw_warm_s'])),
+                            'dw_converged_frac': float(np.mean(st['dw_converged'])),
+                            'dw_master_fail': int(st['dw_master_fail']), 'dw_master_msg': st['dw_master_msg']})
         if 'joint_s' in m.stats:
             js = np.array(m.stats['joint_s'] or [np.nan])
             out.update({'joint_vars_max': int(max(m.stats['joint_vars'] or [0])), 'joint_s_mean': float(np.nanmean(js)),
@@ -137,7 +178,10 @@ def main():
             continue
         m = run_method(geo, meth, args)
         case['methods'][meth] = m
-        extra = ''.join(f', {k} {m[k]:.3g}' for k in ('boundary_site_frac', 'forecast_frac_refined', 'joint_s_max')
+        extra = ''.join(f', {k} {m[k]:.3g}' for k in ('boundary_site_frac', 'forecast_frac_refined', 'scalars_per_hour',
+                                                      'forecast_values_per_hour', 'linear_item_frac', 'joint_s_max',
+                                                      'dw_rounds_mean', 'dw_parallel_s_mean', 'dw_gap_max',
+                                                      'ds_rounds_mean', 'ds_lps_per_site_hour', 'ds_parallel_s_mean')
                         if k in m)
         print(f"{tag} {meth:>12}: {m['co2_kg']:10.1f} kg, sla {m['sla_violations']}, decision "
               f"{m['decision_s_mean']:.3f}s mean / {m['decision_s_max']:.2f}s max, {m['seconds']:.0f}s{extra}", flush=True)

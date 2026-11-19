@@ -23,7 +23,7 @@ Clock: all sites step together. The episode start is drawn as in SustainDC, in t
 site (the reference); every other site starts at the same instant in its own local standard time (offsets from the
 EPW weather files). With a single site, GeoSustainDC reproduces SustainDC exactly for the same seed.
 
-Interface (geo_dispatch_env.py wraps it as a gymnasium env for a learned dispatcher):
+Interface (geo_jobs.GeoJobsDC subclasses it with a job-level workload):
     obs = geo.reset()
     geo.route(weights)        # optional: route first, so per-site controllers see the work routed to them
     obs, reward, terminated, truncated, info = geo.step({'dispatch': weights (N,) or None, 'sites': [site_actions] * N})
