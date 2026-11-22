@@ -53,7 +53,9 @@ Usage (from the repo root), next to the other baselines (policy kind `mpc_joint`
         --policy mpc_joint:forecast=persistence=mpc_persist --days_per_episode 3
     python eval_compare.py --policy mpc_joint:horizon=96,block=8,samples=64,iters=4,workers=8=mpc_long ...
 Parameters (key=value, comma separated): horizon, block, replan, samples, iters, elites, smoothing, drop_w,
-overdue_w, forecast, forecast_days, end_cost, workers, seed, verbose. See MPCPolicy.__init__.
+overdue_w, forecast, forecast_days, end_cost, workers, seed, verbose, and the conservative workload forecast
+wl_model, wl_q, wl_plan, wl_gamma, wl_aci (workload_forecast.py; e.g. forecast=persistence,wl_model=<model>.npz,wl_q=0.9).
+See MPCPolicy.__init__.
 Metric-aligned oracle (as in scripts/mpc/oracle_sweep.sh):
     mpc_joint:horizon=96,block=8,replan=4,samples=128,iters=5,end_cost=metric,drop_w=0,overdue_w=0,workers=16
 
@@ -86,6 +88,8 @@ def joint_space(include_pv=False):
     return int(np.prod(n_sub)), int(np.ravel_multi_index(noop, n_sub))
 DAY = 96  # 15-minute steps per day
 FORECASTS = ('oracle', 'persistence')
+# Conservative workload forecast parameters (workload_forecast.py), shared with mppi_policy.py's spec parser.
+WL_FLOATS, WL_STRINGS, WL_BOOLS = {'wl_q', 'wl_gamma'}, {'wl_model', 'wl_plan'}, {'wl_aci'}
 END_COSTS = ('proxy', 'metric')
 
 # Exogenous time series read by the managers during SustainDC.step, indexed by each manager's own time_step.
@@ -153,8 +157,11 @@ def persistence_forecast(series, t, days=1):
     return out
 
 
-def planning_model(sdc, forecast='oracle', forecast_days=1):
-    """Clone of the live simulator whose future exogenous inputs follow the forecast. Rollouts clone this."""
+def planning_model(sdc, forecast='oracle', forecast_days=1, workload=None):
+    """Clone of the live simulator whose future exogenous inputs follow the forecast. Rollouts clone this.
+    workload: optional forecast of the workload for the steps right after the current one (workload_forecast.py).
+    The planning model's workload is then that forecast, followed by the persistence forecast (whatever `forecast`
+    is, so no true future workload reaches the planner)."""
     if forecast not in FORECASTS:
         raise ValueError(f'forecast must be one of {FORECASTS}, got {forecast!r}')
     shared = SimCloner.shared_objects(sdc)
@@ -164,6 +171,13 @@ def planning_model(sdc, forecast='oracle', forecast_days=1):
             for attr in attrs:
                 arr = getattr(manager, attr)
                 shared[id(arr)] = persistence_forecast(arr, manager.time_step, forecast_days)
+    if workload is not None:
+        wm = sdc.workload_m
+        t = wm.time_step
+        series = persistence_forecast(wm.cpu_smooth, t, forecast_days)
+        n = min(len(workload), len(series) - t - 1)
+        series[t + 1:t + 1 + n] = np.asarray(workload, dtype=float)[:n]
+        shared[id(wm.cpu_smooth)] = series
     return SimCloner.clone(sdc, shared)
 
 
@@ -240,12 +254,12 @@ def _worker_main(conn):
         msg = conn.recv()
         try:
             if msg[0] == 'state':
-                _, new_statics, keep, state, forecast, forecast_days = msg
+                _, new_statics, keep, state, forecast, forecast_days, workload = msg
                 cache.update(pickle.loads(new_statics))
                 cache = {k: cache[k] for k in keep}
                 unpickler = pickle.Unpickler(io.BytesIO(state))
                 unpickler.persistent_load = cache.__getitem__
-                model = planning_model(unpickler.load(), forecast, forecast_days)
+                model = planning_model(unpickler.load(), forecast, forecast_days, workload)
                 shared = SimCloner.shared_objects(model)
                 conn.send(('ok', None))
             elif msg[0] == 'eval':
@@ -275,7 +289,7 @@ class RolloutPool:
         self._sent = {}  # key -> static object currently cached by every worker (references keep ids unique)
         atexit.register(self.close)
 
-    def set_state(self, sdc, forecast, forecast_days):
+    def set_state(self, sdc, forecast, forecast_days, workload=None):
         statics = {id(obj): obj for obj in SimCloner.shared_objects(sdc).values()}
         keys = {i: _static_key(obj) for i, obj in statics.items()}
         buf = io.BytesIO()
@@ -285,7 +299,7 @@ class RolloutPool:
         new = {keys[i]: obj for i, obj in statics.items() if keys[i] not in self._sent}
         self._sent = {keys[i]: obj for i, obj in statics.items()}
         msg = ('state', pickle.dumps(new, protocol=pickle.HIGHEST_PROTOCOL), list(self._sent), buf.getvalue(),
-               forecast, forecast_days)
+               forecast, forecast_days, workload)
         for conn in self.conns:
             conn.send(msg)
         for conn in self.conns:
@@ -337,7 +351,7 @@ class MPCPolicy:
 
     def __init__(self, horizon=48, block=4, replan=None, samples=32, iters=3, elites=6, smoothing=0.7,
                  drop_w=10.0, overdue_w=1.0, forecast='oracle', forecast_days=1, end_cost='proxy', workers=0, seed=0,
-                 verbose=False):
+                 verbose=False, wl_model=None, wl_q=0.9, wl_plan='upper', wl_gamma=0.05, wl_aci=True):
         """
         horizon:       planning horizon in 15-minute steps (rounded up to a whole number of blocks). 48 = 12 h.
         block:         steps each planned joint action is held (move blocking).
@@ -354,6 +368,14 @@ class MPCPolicy:
                        queue as co2_work_adjusted does, no battery credit). See the module doc.
         workers:       rollout processes (0 or 1: in-process). Results do not depend on it.
         seed:          added to the episode seed to seed the CEM sampling.
+        wl_model:      workload quantile model (.npz from workload_forecast.py fit). Unset: the workload follows
+                       `forecast` like the other exogenous inputs. Set: the planner's workload for the next 24 h is
+                       the conservative forecast below (then persistence), whatever `forecast` is.
+        wl_q:          quantile planned on with wl_plan=upper (one of the fitted quantiles; see critical_quantile).
+        wl_plan:       'upper' (q-quantile + adaptive conformal margin) or 'median' (the median model, no margin).
+        wl_gamma:      step of the conformal margin update, in units of the model's error scale (the larger of its
+                       training MAE and its recent online error).
+        wl_aci:        adapt the margin online (False: the raw q-quantile).
         """
         self.block = int(block)
         self.n_blocks = max(1, -(-int(horizon) // self.block))
@@ -377,6 +399,10 @@ class MPCPolicy:
         self.seed_offset = int(seed)
         self.verbose = verbose
         self._pool = None
+        self.wl = None
+        if wl_model:
+            from workload_forecast import WorkloadForecaster
+            self.wl = WorkloadForecaster(wl_model, q=float(wl_q), plan=wl_plan, gamma=float(wl_gamma), aci=wl_aci)
         self.reset(0)
 
     # -- episode ------------------------------------------------------------------------------------------------------
@@ -387,6 +413,8 @@ class MPCPolicy:
         self.plan = None          # best plan from the last replan: joint action per block
         self.pending = []         # joint actions still to execute from the current plan
         self.stats = {'replans': 0, 'rollouts': 0, 'plan_seconds': 0.0}
+        if self.wl is not None:
+            self.wl.reset()
 
     def act(self, sdc):
         a = self.act_joint(sdc)
@@ -418,12 +446,16 @@ class MPCPolicy:
                   'end_cost': self.end_cost,
                   'task_g': task_kwh * float(sdc.ci_m.carbon_smooth[sdc.ci_m.time_step]),  # current CI is known
                   'include_pv': self.include_pv}
+        workload = None
+        if self.wl is not None:  # conservative forecast from the loads observed up to now
+            wm = sdc.workload_m
+            workload = self.wl.forecast(wm.cpu_smooth[:wm.time_step + 1], wm.time_step, self.horizon)
         if self.workers > 1:
             if self._pool is None:
                 self._pool = RolloutPool(self.workers)
-            self._pool.set_state(sdc, self.forecast, self.forecast_days)
+            self._pool.set_state(sdc, self.forecast, self.forecast_days, workload)
             return lambda plans: self._pool.evaluate(plans, params)
-        model = planning_model(sdc, self.forecast, self.forecast_days)
+        model = planning_model(sdc, self.forecast, self.forecast_days, workload)
         shared = SimCloner.shared_objects(model)
         return lambda plans: [rollout_cost(model, shared, p, params) for p in plans]
 
@@ -483,9 +515,9 @@ def make_mpc_policy(rest):
     """Build an MPCPolicy from 'key=value,...' (the part after 'mpc_joint:' in an eval_compare spec)."""
     params = dict(kv.split('=', 1) for kv in rest.split(',') if kv) if rest else {}
     ints = {'horizon', 'block', 'replan', 'samples', 'iters', 'elites', 'seed', 'forecast_days', 'workers'}
-    floats = {'smoothing', 'drop_w', 'overdue_w'}
-    strings = {'forecast', 'end_cost'}
-    valid = ints | floats | strings | {'verbose'}
+    floats = {'smoothing', 'drop_w', 'overdue_w'} | WL_FLOATS
+    strings = {'forecast', 'end_cost'} | WL_STRINGS
+    valid = ints | floats | strings | {'verbose'} | WL_BOOLS
     unknown = set(params) - valid
     if unknown:
         raise ValueError(f'Unknown mpc parameter(s) {sorted(unknown)}; valid: {sorted(valid)}')
@@ -495,7 +527,7 @@ def make_mpc_policy(rest):
             kwargs[k] = int(v)
         elif k in floats:
             kwargs[k] = float(v)
-        elif k == 'verbose':
+        elif k == 'verbose' or k in WL_BOOLS:
             kwargs[k] = v.lower() in ('1', 'true', 'yes')
         else:
             kwargs[k] = v

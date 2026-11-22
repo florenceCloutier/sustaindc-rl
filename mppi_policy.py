@@ -49,13 +49,14 @@ Usage (from the repo root), policy kind `mppi`:
     python eval_compare.py --policy mppi:sampling=categorical,ess=10=mppi_cat ...
 Parameters (key=value, comma separated): horizon, block, replan, samples, iters, ess, temperature, noise,
 noise_decay, sampling, rounding, seed_plans, smoothing, execute, drop_w, overdue_w, forecast, forecast_days, end_cost,
-workers, seed, verbose. See MPPIPolicy.__init__.
+workers, seed, verbose, and the conservative workload forecast wl_model, wl_q, wl_plan, wl_gamma, wl_aci
+(workload_forecast.py). See MPPIPolicy.__init__.
 """
 import time
 
 import numpy as np
 
-from mpc_policy import MPCPolicy
+from mpc_policy import WL_BOOLS, WL_FLOATS, WL_STRINGS, MPCPolicy
 from sustaindc_single_env import sub_actions
 
 SAMPLINGS = ('gaussian', 'categorical')
@@ -140,9 +141,11 @@ class MPPIPolicy(MPCPolicy):
     def __init__(self, horizon=48, block=4, replan=None, samples=32, iters=3, ess=None, temperature=None, noise=0.6,
                  noise_decay=1.0, sampling='gaussian', rounding='stochastic', seed_plans=True, smoothing=None,
                  execute='best', drop_w=10.0, overdue_w=1.0, forecast='oracle', forecast_days=1, end_cost='proxy',
-                 workers=0, seed=0, verbose=False):
+                 workers=0, seed=0, verbose=False, wl_model=None, wl_q=0.9, wl_plan='upper', wl_gamma=0.05,
+                 wl_aci=True):
         """
-        horizon, block, replan, drop_w, overdue_w, forecast, forecast_days, end_cost, workers, seed, verbose:
+        horizon, block, replan, drop_w, overdue_w, forecast, forecast_days, end_cost, workers, seed, verbose,
+        wl_model, wl_q, wl_plan, wl_gamma, wl_aci:
                        as for MPCPolicy (mpc_policy.py).
         samples:       sampled plans rolled out per MPPI iteration (the first is the nominal plan itself).
         iters:         MPPI iterations per replan.
@@ -161,7 +164,8 @@ class MPPIPolicy(MPCPolicy):
         """
         super().__init__(horizon=horizon, block=block, replan=replan, samples=samples, iters=iters,
                          drop_w=drop_w, overdue_w=overdue_w, forecast=forecast, forecast_days=forecast_days,
-                         end_cost=end_cost, workers=workers, seed=seed, verbose=verbose)
+                         end_cost=end_cost, workers=workers, seed=seed, verbose=verbose, wl_model=wl_model,
+                         wl_q=wl_q, wl_plan=wl_plan, wl_gamma=wl_gamma, wl_aci=wl_aci)
         if sampling not in SAMPLINGS:
             raise ValueError(f'sampling must be one of {SAMPLINGS}, got {sampling!r}')
         if execute not in EXECUTES:
@@ -339,9 +343,9 @@ def make_mppi_policy(rest):
     """Build an MPPIPolicy from 'key=value,...' (the part after 'mppi:' in an eval_compare spec)."""
     params = dict(kv.split('=', 1) for kv in rest.split(',') if kv) if rest else {}
     ints = {'horizon', 'block', 'replan', 'samples', 'iters', 'seed', 'forecast_days', 'workers'}
-    floats = {'ess', 'temperature', 'noise', 'noise_decay', 'smoothing', 'drop_w', 'overdue_w'}
-    strings = {'forecast', 'end_cost', 'sampling', 'execute', 'rounding'}
-    bools = {'verbose', 'seed_plans'}
+    floats = {'ess', 'temperature', 'noise', 'noise_decay', 'smoothing', 'drop_w', 'overdue_w'} | WL_FLOATS
+    strings = {'forecast', 'end_cost', 'sampling', 'execute', 'rounding'} | WL_STRINGS
+    bools = {'verbose', 'seed_plans'} | WL_BOOLS
     valid = ints | floats | strings | bools
     unknown = set(params) - valid
     if unknown:
